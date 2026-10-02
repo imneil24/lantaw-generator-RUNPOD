@@ -1,3 +1,4 @@
+import math
 import os
 import tempfile
 import threading
@@ -30,6 +31,8 @@ ASPECT_RATIO_DIMENSIONS = {
 # backward compatibility, not a stand-in for a missing value.
 DEFAULT_ASPECT_RATIO = "16:9"
 FPS = 24
+# The VAE's temporal grid: a valid frame count satisfies (frames - 1) % FRAME_GRID_STEP == 0.
+FRAME_GRID_STEP = 8
 FAST_MAX_DURATION = 20
 
 MODEL_ROOT = "/runpod-volume/ltx-2.5"
@@ -141,11 +144,23 @@ def validate_input(job_input: dict) -> GenerationRequest:
     )
 
 
+def _frames_for_duration(duration: float) -> int:
+    """Smallest valid frame count (8k+1) that covers `duration` at FPS.
+
+    snap_frames_to_grid FLOORS, so a whole-second duration (a multiple of 8
+    frames) would come out 7 frames (0.29s) short; adding FRAME_GRID_STEP - 1
+    first makes the floor land on the first grid value >= the target.
+    """
+    # round() guards float noise like 145.00000000000003
+    target = math.ceil(round(duration * FPS, 6))
+    return snap_frames_to_grid(target + FRAME_GRID_STEP - 1)
+
+
 def _generate_video(request: GenerationRequest) -> bytes:
     pipeline = load_pipeline()
-    # The VAE's causal temporal grid requires (frames - 1) % scale_factors.time == 0;
-    # snap_frames_to_grid rounds down to the nearest valid value.
-    num_frames = snap_frames_to_grid(round(request.duration * FPS))
+    # The VAE's causal temporal grid requires (frames - 1) % FRAME_GRID_STEP == 0;
+    # _frames_for_duration rounds UP to the first valid value covering the duration.
+    num_frames = _frames_for_duration(request.duration)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
         output_path = tmp_file.name

@@ -1,5 +1,7 @@
+import contextlib
 import threading
 import time
+import types
 import pytest
 import handler as handler_module
 from handler import validate_input, handler
@@ -145,3 +147,58 @@ def test_load_pipeline_is_thread_safe_under_concurrent_calls(monkeypatch):
         t.join()
 
     assert call_count["n"] == 1
+
+
+def _real_snap(frames):
+    # The local venv's stub snap_frames_to_grid is the identity function; this
+    # is the real ltx_pipelines.utils.helpers formula (floors to 8k+1).
+    return ((frames - 1) // 8) * 8 + 1
+
+
+@pytest.mark.parametrize("duration", [1, 5, 6, 8, 10, 19.5, 20, 0.5, 145 / 24])
+def test_frames_for_duration_covers_duration_on_the_frame_grid(monkeypatch, duration):
+    monkeypatch.setattr(handler_module, "snap_frames_to_grid", _real_snap)
+    result = handler_module._frames_for_duration(duration)
+    assert result >= duration * 24 - 1e-6
+    assert (result - 1) % 8 == 0
+    assert result - duration * 24 < 8
+
+
+def test_frames_for_whole_second_duration_is_not_short(monkeypatch):
+    monkeypatch.setattr(handler_module, "snap_frames_to_grid", _real_snap)
+    assert handler_module._frames_for_duration(6) == 145  # not 137 (0.29s short)
+
+
+def test_frames_for_exact_grid_duration_ignores_float_noise(monkeypatch):
+    monkeypatch.setattr(handler_module, "snap_frames_to_grid", _real_snap)
+    # 145/24*24 == 145.00000000000003 in floats; a naive ceil would give 146 -> 153.
+    assert handler_module._frames_for_duration(145 / 24) == 145
+
+
+def test_generate_video_passes_snapped_up_num_frames_to_pipeline(monkeypatch):
+    monkeypatch.setattr(handler_module, "snap_frames_to_grid", _real_snap)
+    seen = {}
+
+    class FakePipeline:
+        def __call__(self, **kwargs):
+            seen.update(kwargs)
+            return types.SimpleNamespace(
+                video="v", audio="a", num_frames=kwargs["num_frames"], tiling_config="t",
+            )
+
+    def fake_encode_video(video, fps, audio, output_path, video_chunks_number):
+        with open(output_path, "wb") as f:
+            f.write(b"mp4-bytes")
+
+    monkeypatch.setattr(handler_module, "load_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(handler_module, "encode_video", fake_encode_video)
+    monkeypatch.setattr(handler_module, "get_video_chunks_number", lambda n, cfg: 1)
+    monkeypatch.setattr(
+        handler_module, "torch", types.SimpleNamespace(no_grad=contextlib.nullcontext)
+    )
+
+    request = handler_module.GenerationRequest(
+        prompt="a cat", duration=6, width=1920, height=1088
+    )
+    assert handler_module._generate_video(request) == b"mp4-bytes"
+    assert seen["num_frames"] == handler_module._frames_for_duration(6) == 145

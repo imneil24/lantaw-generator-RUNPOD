@@ -43,19 +43,32 @@ VIDEO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-video-vae-bf16.safetensors"
 AUDIO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-audio-vae-bf16.safetensors"
 SPATIAL_UPSAMPLER_PATH = f"{MODEL_ROOT}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
 
-# UNVERIFIED: values below are placeholders until the A2Vid spike has been run
-# (docs/superpowers/spikes/a2vid-spike-runbook.md); replace them with the
-# "Working call" in the findings doc. Do not treat them as proven: nothing in
-# this repo has ever run A2VidPipelineTwoStage against the LTX-2.5 weights.
-#
-# Extra kwargs the spike needed for A2VidPipelineTwoStage.__call__ beyond
-# prompt/seed/height/width/frame_rate/num_frames/images/audio_path (empty dict
-# if it needed none). Copied verbatim from the findings doc once it exists.
-A2V_CALL_KWARGS: dict = {}
+def _a2v_call_kwargs() -> dict:
+    # Extra required args of A2VidPipelineTwoStage.__call__ beyond
+    # prompt/seed/height/width/frame_rate/num_frames/images/audio_path. The
+    # real call failed live with a TypeError naming negative_prompt,
+    # num_inference_steps and video_guider_params as missing.
+    #
+    # Source: ltx_pipelines.utils.constants (Lightricks/LTX-2 main). detect_params
+    # reads the checkpoint's declared model_version and returns the params of the
+    # newest generation at or below it, so these values follow the checkpoint
+    # and a model upgrade changes them automatically.
+    #
+    # UNVERIFIED: the call signature is from library source, but this has not yet
+    # run to completion on real hardware; output quality and speed are unverified.
+    # Imported lazily (like _image_conditioning) so tests run without the library.
+    from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, detect_params
+
+    params = detect_params(TRANSFORMER_PATH)
+    return {
+        "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
+        "num_inference_steps": params.num_inference_steps,
+        "video_guider_params": params.video_guider_params,
+    }
 
 
 def _a2v_pipeline_kwargs() -> dict:
-    # UNVERIFIED placeholder (see the note above A2V_CALL_KWARGS): extra
+    # UNVERIFIED placeholder: extra
     # constructor kwargs from the findings doc's "Working call" (the
     # distilled_lora value, [] when none is required). The spike has not run,
     # so whether a distilled LoRA is needed at all is not known.
@@ -351,7 +364,7 @@ def _generate_ia2v_video(request: GenerationRequest) -> bytes:
                 num_frames=num_frames,
                 images=[_image_conditioning(image_path)],
                 audio_path=audio_path,
-                **A2V_CALL_KWARGS,
+                **_a2v_call_kwargs(),
             )
             # result.audio is the INPUT audio passed through (docs/pipelines.md
             # of ltx-pipelines), which is what a lip-synced clip must carry.

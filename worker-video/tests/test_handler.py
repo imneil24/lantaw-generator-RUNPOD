@@ -1,5 +1,6 @@
 import contextlib
 import os
+import sys
 import threading
 import time
 import types
@@ -347,6 +348,11 @@ def test_generate_ia2v_video_feeds_the_downloaded_files_to_the_a2v_pipeline(monk
     monkeypatch.setattr(handler_module, "load_a2v_pipeline", lambda: FakePipeline())
     monkeypatch.setattr(handler_module, "_download_from_r2", fake_download)
     monkeypatch.setattr(handler_module, "_image_conditioning", lambda path: ("image", path))
+    monkeypatch.setattr(
+        handler_module,
+        "_a2v_call_kwargs",
+        lambda: {"negative_prompt": "neg", "num_inference_steps": 7, "video_guider_params": "vgp"},
+    )
     monkeypatch.setattr(handler_module, "encode_video", fake_encode)
     monkeypatch.setattr(handler_module, "get_video_chunks_number", lambda *a: 1)
     monkeypatch.setattr(handler_module, "torch", SimpleNamespace(no_grad=contextlib.nullcontext))
@@ -367,8 +373,31 @@ def test_generate_ia2v_video_feeds_the_downloaded_files_to_the_a2v_pipeline(monk
     assert kwargs["audio_path"].endswith(".mp3") and os.path.basename(kwargs["audio_path"]).startswith("audio")
     assert kwargs["images"] == [("image", kwargs["images"][0][1])]
     assert kwargs["images"][0][1].endswith(".jpg")
+    assert kwargs["negative_prompt"] == "neg"
+    assert kwargs["num_inference_steps"] == 7
+    assert kwargs["video_guider_params"] == "vgp"
     # the INPUT audio is what gets muxed (result.audio), at the worker's fps
     assert calls["encode"] == {"video": "v", "audio": "a", "fps": handler_module.FPS}
+
+
+def test_a2v_call_kwargs_come_from_the_librarys_detect_params(monkeypatch):
+    seen = {}
+
+    def fake_detect_params(checkpoint_path):
+        seen["checkpoint_path"] = checkpoint_path
+        return SimpleNamespace(num_inference_steps=30, video_guider_params="G")
+
+    fake_constants = types.ModuleType("ltx_pipelines.utils.constants")
+    fake_constants.detect_params = fake_detect_params
+    fake_constants.DEFAULT_NEGATIVE_PROMPT = "N"
+    monkeypatch.setitem(sys.modules, "ltx_pipelines.utils.constants", fake_constants)
+
+    assert handler_module._a2v_call_kwargs() == {
+        "negative_prompt": "N",
+        "num_inference_steps": 30,
+        "video_guider_params": "G",
+    }
+    assert seen["checkpoint_path"] == handler_module.TRANSFORMER_PATH
 
 
 def test_load_a2v_pipeline_is_thread_safe_under_concurrent_calls(monkeypatch):

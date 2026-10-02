@@ -112,9 +112,12 @@ them from R2 with a separate read credential, so the endpoint also needs
 ia2v request (guarded by the same double-checked lock), so a t2v-only worker
 never loads it. What is NOT known: the A2Vid spike
 (`docs/superpowers/spikes/a2vid-spike-runbook.md`) has not been run, so
-`A2V_CALL_KWARGS`, `_a2v_pipeline_kwargs()` (the `distilled_lora` constructor
-kwarg) and the `ImageConditioningInput` import in `handler.py` are placeholders
-marked `UNVERIFIED`, not proven values; whether the 2.5 distilled transformer
+`_a2v_call_kwargs()` (negative prompt, step count and video guider params, taken
+from the library's `detect_params` for the checkpoint's model version; the call
+signature is from library source but it has not run to completion on real
+hardware), `_a2v_pipeline_kwargs()` (the `distilled_lora` constructor kwarg) and
+the `ImageConditioningInput` import in `handler.py` are marked `UNVERIFIED`, not
+proven values; whether the 2.5 distilled transformer
 works as the A2Vid stage-1 checkpoint, whether it fits next to the
 `DistilledPipeline` in one worker, and whether it runs on a Blackwell card are
 all unanswered. The `Dockerfile` still clones LTX-2 unpinned (no commit SHA has

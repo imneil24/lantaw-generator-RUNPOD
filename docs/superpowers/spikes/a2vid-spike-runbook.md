@@ -3,8 +3,9 @@
 Status: **NOT YET RUN.** Nothing in this document records an observed result. It
 is a checklist of commands to run and a template for what to record. The
 worker's ia2v mode (Task 8) was written before this spike ran, so its A2Vid
-constructor and call kwargs are placeholders until this is done (see the
-`UNVERIFIED` comment above `A2V_CALL_KWARGS` in `worker-video/handler.py`).
+constructor kwargs are placeholders until this is done. The call kwargs now come
+from the library's `detect_params` (see `_a2v_call_kwargs()` in
+`worker-video/handler.py`), still unverified end to end.
 
 Question being answered: can `A2VidPipelineTwoStage` (LTX-2 repo) run on the
 LTX-2.5 weights on `/runpod-volume/ltx-2.5`, with one avatar image and one
@@ -150,7 +151,7 @@ git add docs/superpowers/spikes/2026-10-a2vid-findings.md
 git commit -m "docs: record the A2Vid spike findings"
 ```
 
-- [ ] Then replace the placeholders in `worker-video/handler.py` (`A2V_CALL_KWARGS`,
+- [ ] Then replace the placeholders in `worker-video/handler.py` (`_a2v_call_kwargs()`,
       `_a2v_pipeline_kwargs()`, and the `_image_conditioning` import if it moved)
       with the findings doc's `## Working call`, pin the Dockerfile
       (`ARG LTX2_COMMIT=<SHA from ## Pin>` plus

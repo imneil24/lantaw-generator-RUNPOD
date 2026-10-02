@@ -6,9 +6,32 @@ from handler import validate_input, handler
 
 
 def test_validate_input_accepts_valid_payload():
-    prompt, duration = validate_input({"prompt": "a river at dawn", "duration": 8})
-    assert prompt == "a river at dawn"
-    assert duration == 8.0
+    request = validate_input({"prompt": "a river at dawn", "duration": 8})
+    assert request.prompt == "a river at dawn"
+    assert request.duration == 8.0
+
+
+def test_validate_input_defaults_to_landscape_for_existing_callers():
+    # The deployed backend (backend/app/runpod_client.py) sends no aspect_ratio.
+    request = validate_input({"prompt": "x", "duration": 8})
+    assert (request.width, request.height) == (1920, 1088)
+
+
+def test_validate_input_maps_portrait_to_fixed_dimensions():
+    request = validate_input({"prompt": "x", "duration": 8, "aspect_ratio": "9:16"})
+    assert (request.width, request.height) == (1088, 1920)
+
+
+def test_validate_input_dimensions_are_divisible_by_64():
+    # DistilledPipeline's assert_resolution requires it (see handler.py comment).
+    for width, height in handler_module.ASPECT_RATIO_DIMENSIONS.values():
+        assert width % 64 == 0 and height % 64 == 0
+
+
+@pytest.mark.parametrize("bad", ["1:1", "", "16:9 ", None, 7, ["16:9"], {"a": 1}])
+def test_validate_input_rejects_unknown_aspect_ratio(bad):
+    with pytest.raises(ValueError):
+        validate_input({"prompt": "x", "duration": 8, "aspect_ratio": bad})
 
 
 def test_validate_input_rejects_missing_prompt():
@@ -21,6 +44,12 @@ def test_validate_input_rejects_extra_fields():
         validate_input({"prompt": "x", "duration": 8, "image_url": "http://evil.example.com"})
 
 
+def test_validate_input_rejects_width_and_height_fields():
+    # Resolution is never caller-controlled; only the aspect_ratio enum picks it.
+    with pytest.raises(ValueError):
+        validate_input({"prompt": "x", "duration": 8, "width": 4096, "height": 4096})
+
+
 def test_validate_input_rejects_out_of_range_duration():
     with pytest.raises(ValueError):
         validate_input({"prompt": "x", "duration": 0})
@@ -31,7 +60,7 @@ def test_validate_input_rejects_out_of_range_duration():
 def test_handler_uploads_to_r2_and_returns_key_only(monkeypatch):
     uploaded = {}
 
-    def fake_generate(prompt, duration):
+    def fake_generate(request):
         return b"fake-video-bytes"
 
     def fake_upload(key, data, content_type):
@@ -55,13 +84,26 @@ def test_handler_uploads_to_r2_and_returns_key_only(monkeypatch):
     assert uploaded["content_type"] == "video/mp4"
 
 
+def test_handler_passes_the_chosen_dimensions_to_generation(monkeypatch):
+    seen = {}
+
+    def fake_generate(request):
+        seen["dims"] = (request.width, request.height)
+        return b"v"
+
+    monkeypatch.setattr("handler._generate_video", fake_generate)
+    monkeypatch.setattr("handler._upload_to_r2", lambda key, data, content_type: None)
+    handler({"input": {"prompt": "a cat", "duration": 8, "aspect_ratio": "9:16"}})
+    assert seen["dims"] == (1088, 1920)
+
+
 def test_handler_logs_before_and_after_r2_upload(monkeypatch, capsys):
     # RunPod's own container can die/restart mid-job with no exception ever
     # logged (confirmed via RunPod's own logs: "Video saved" followed
     # immediately by "Failed to return job results | 400" with no traceback
     # in between) — these log lines are the only way to tell, after the
     # fact, whether _upload_to_r2 was ever reached and whether it finished.
-    monkeypatch.setattr("handler._generate_video", lambda prompt, duration: b"fake-video-bytes")
+    monkeypatch.setattr("handler._generate_video", lambda request: b"fake-video-bytes")
     monkeypatch.setattr("handler._upload_to_r2", lambda key, data, content_type: None)
 
     handler({"input": {"prompt": "a cat", "duration": 8}})
@@ -77,7 +119,7 @@ def test_handler_returns_error_on_invalid_input():
 
 
 def test_handler_rejects_blocked_prompt_without_calling_generate(monkeypatch):
-    def fail_if_called(prompt, duration):
+    def fail_if_called(request):
         raise AssertionError("_generate_video should not be called for a blocked prompt")
 
     monkeypatch.setattr("handler._generate_video", fail_if_called)

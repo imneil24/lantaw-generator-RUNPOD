@@ -86,8 +86,7 @@ handler nor backend schema accepts a URL-shaped field (no `image_url`) —
 this is the specific mechanism that closes off SSRF. When adding a field to
 `GenerateImageRequest`/`GenerateVideoRequest` or either handler's
 `validate_input`, preserve `extra="forbid"` and do not add caller-controlled
-URLs. Resolution/fps/model-variant are hardcoded server-side in the handlers,
-never sourced from the request.
+URLs. Resolution is chosen server-side from a closed `aspect_ratio` enum (`16:9` or `9:16`, optional, default `16:9` for callers that predate it) and never from a width/height field; fps and model variant are hardcoded in the handlers.
 
 **Two RunPod workers, one shared shape but independent deploy lifecycles.**
 `worker-video/handler.py` and `worker-image/handler.py` both: load their

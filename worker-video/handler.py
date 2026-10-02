@@ -2,6 +2,7 @@ import os
 import tempfile
 import threading
 import uuid
+from dataclasses import dataclass
 
 import boto3
 import torch
@@ -16,9 +17,18 @@ from ltx_pipelines.utils.types import OffloadMode
 # Two-stage pipelines (DistilledPipeline) require both dimensions divisible by
 # 64 (ltx_pipelines.utils.helpers.assert_resolution). 1088 is the standard
 # "1080p-safe" height used across video codecs for exactly this reason
-# (64 * 17 = 1088); true 1080 is not a multiple of 64.
-RESOLUTION_WIDTH = 1920
-RESOLUTION_HEIGHT = 1088
+# (64 * 17 = 1088); true 1080 is not a multiple of 64. 1920 = 64 * 30.
+# The caller picks only an orientation (never a width/height): resolution is
+# a server-side decision, so a leaked RunPod key cannot ask for a size that
+# exhausts GPU memory.
+ASPECT_RATIO_DIMENSIONS = {
+    "16:9": (1920, 1088),
+    "9:16": (1088, 1920),
+}
+# Callers that predate aspect_ratio (backend/app/runpod_client.py) send only
+# prompt+duration and were always served landscape; keeping that behaviour is
+# backward compatibility, not a stand-in for a missing value.
+DEFAULT_ASPECT_RATIO = "16:9"
 FPS = 24
 FAST_MAX_DURATION = 20
 
@@ -103,8 +113,16 @@ def load_pipeline() -> DistilledPipeline:
     return _PIPELINE
 
 
-def validate_input(job_input: dict) -> tuple[str, float]:
-    allowed_keys = {"prompt", "duration"}
+@dataclass(frozen=True)
+class GenerationRequest:
+    prompt: str
+    duration: float
+    width: int
+    height: int
+
+
+def validate_input(job_input: dict) -> GenerationRequest:
+    allowed_keys = {"prompt", "duration", "aspect_ratio"}
     if set(job_input.keys()) - allowed_keys:
         raise ValueError(f"unexpected fields: {set(job_input.keys()) - allowed_keys}")
     if "prompt" not in job_input or not isinstance(job_input["prompt"], str) or not job_input["prompt"].strip():
@@ -114,14 +132,20 @@ def validate_input(job_input: dict) -> tuple[str, float]:
     duration = float(job_input["duration"])
     if not (0 < duration <= FAST_MAX_DURATION):
         raise ValueError(f"duration must be between 0 and {FAST_MAX_DURATION}")
-    return job_input["prompt"], duration
+    aspect_ratio = job_input.get("aspect_ratio", DEFAULT_ASPECT_RATIO)
+    if not isinstance(aspect_ratio, str) or aspect_ratio not in ASPECT_RATIO_DIMENSIONS:
+        raise ValueError(f"aspect_ratio must be one of {sorted(ASPECT_RATIO_DIMENSIONS)}")
+    width, height = ASPECT_RATIO_DIMENSIONS[aspect_ratio]
+    return GenerationRequest(
+        prompt=job_input["prompt"], duration=duration, width=width, height=height
+    )
 
 
-def _generate_video(prompt: str, duration: float) -> bytes:
+def _generate_video(request: GenerationRequest) -> bytes:
     pipeline = load_pipeline()
     # The VAE's causal temporal grid requires (frames - 1) % scale_factors.time == 0;
     # snap_frames_to_grid rounds down to the nearest valid value.
-    num_frames = snap_frames_to_grid(round(duration * FPS))
+    num_frames = snap_frames_to_grid(round(request.duration * FPS))
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
         output_path = tmp_file.name
@@ -141,10 +165,10 @@ def _generate_video(prompt: str, duration: float) -> bytes:
         # inference tensors, so it doesn't trip this check.
         with torch.no_grad():
             result = pipeline(
-                prompt=prompt,
+                prompt=request.prompt,
                 seed=int.from_bytes(os.urandom(4), "big"),
-                height=RESOLUTION_HEIGHT,
-                width=RESOLUTION_WIDTH,
+                height=request.height,
+                width=request.width,
                 frame_rate=FPS,
                 images=[],
                 num_frames=num_frames,
@@ -164,14 +188,14 @@ def _generate_video(prompt: str, duration: float) -> bytes:
 
 def handler(job: dict) -> dict:
     try:
-        prompt, duration = validate_input(job.get("input", {}))
+        request = validate_input(job.get("input", {}))
     except ValueError as e:
         return {"error": str(e)}
 
-    if _is_blocked(prompt):
+    if _is_blocked(request.prompt):
         return {"error": "prompt rejected by moderation"}
 
-    video_bytes = _generate_video(prompt, duration)
+    video_bytes = _generate_video(request)
     key = f"clips/{uuid.uuid4().hex}.mp4"
     # Uploaded directly from the worker rather than returned as bytes_b64:
     # RunPod's own /job-done callback rejects a full HD video base64-encoded

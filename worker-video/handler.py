@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -42,6 +43,25 @@ VIDEO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-video-vae-bf16.safetensors"
 AUDIO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-audio-vae-bf16.safetensors"
 SPATIAL_UPSAMPLER_PATH = f"{MODEL_ROOT}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
 
+# UNVERIFIED: values below are placeholders until the A2Vid spike has been run
+# (docs/superpowers/spikes/a2vid-spike-runbook.md); replace them with the
+# "Working call" in the findings doc. Do not treat them as proven: nothing in
+# this repo has ever run A2VidPipelineTwoStage against the LTX-2.5 weights.
+#
+# Extra kwargs the spike needed for A2VidPipelineTwoStage.__call__ beyond
+# prompt/seed/height/width/frame_rate/num_frames/images/audio_path (empty dict
+# if it needed none). Copied verbatim from the findings doc once it exists.
+A2V_CALL_KWARGS: dict = {}
+
+
+def _a2v_pipeline_kwargs() -> dict:
+    # UNVERIFIED placeholder (see the note above A2V_CALL_KWARGS): extra
+    # constructor kwargs from the findings doc's "Working call" (the
+    # distilled_lora value, [] when none is required). The spike has not run,
+    # so whether a distilled LoRA is needed at all is not known.
+    return {"distilled_lora": []}
+
+
 # Mirrors backend/app/moderation.py's DEFAULT_BLOCKLIST. The RunPod endpoint
 # is reachable directly with its own Bearer key, independent of the backend
 # proxy — this is a second, independent trust boundary, so moderation must
@@ -83,6 +103,27 @@ def _upload_to_r2(key: str, data: bytes, content_type: str) -> None:
     )
 
 
+_R2_READ_CLIENT = None
+
+
+def _get_r2_read_client():
+    # The write credential is not assumed to be able to read; the backend's
+    # own R2_READ_KEY/R2_READ_SECRET pair works for this bucket.
+    global _R2_READ_CLIENT
+    if _R2_READ_CLIENT is None:
+        _R2_READ_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=os.environ["R2_ENDPOINT"],
+            aws_access_key_id=os.environ["R2_READ_KEY"],
+            aws_secret_access_key=os.environ["R2_READ_SECRET"],
+        )
+    return _R2_READ_CLIENT
+
+
+def _download_from_r2(key: str, dest_path: str) -> None:
+    _get_r2_read_client().download_file(os.environ["R2_BUCKET"], key, dest_path)
+
+
 def _load_pipeline_impl() -> DistilledPipeline:
     model_paths = ModelPaths.from_split(
         transformer_path=TRANSFORMER_PATH,
@@ -116,16 +157,85 @@ def load_pipeline() -> DistilledPipeline:
     return _PIPELINE
 
 
+_A2V_PIPELINE = None
+_A2V_PIPELINE_LOCK = threading.Lock()
+
+
+def _load_a2v_pipeline_impl():
+    # Imported here (not at module top) so the worker's t2v path and the unit
+    # tests never need the A2Vid module; a t2v-only worker never loads it.
+    from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
+
+    model_paths = ModelPaths.from_split(
+        transformer_path=TRANSFORMER_PATH,
+        text_encoder_path=TEXT_ENCODER_PATH,
+        video_vae_path=VIDEO_VAE_PATH,
+        audio_vae_path=AUDIO_VAE_PATH,
+    )
+    return A2VidPipelineTwoStage(
+        model_paths=model_paths,
+        spatial_upsampler_path=SPATIAL_UPSAMPLER_PATH,
+        loras=[],
+        offload_mode=OffloadMode.CPU,
+        **_a2v_pipeline_kwargs(),
+    )
+
+
+def load_a2v_pipeline():
+    # Same double-checked lock as load_pipeline: concurrent requests on one
+    # warm worker must not both run the weight-loading init.
+    global _A2V_PIPELINE
+    if _A2V_PIPELINE is None:
+        with _A2V_PIPELINE_LOCK:
+            if _A2V_PIPELINE is None:
+                _A2V_PIPELINE = _load_a2v_pipeline_impl()
+    return _A2V_PIPELINE
+
+
+def _image_conditioning(path: str):
+    # UNVERIFIED: the import path and the (path, frame_idx, strength) shape are
+    # from the LTX-2 GitHub main source read while planning, not from a run;
+    # confirm against the spike findings ("Signatures").
+    from ltx_pipelines.utils.types import ImageConditioningInput
+
+    return ImageConditioningInput(path=path, frame_idx=0, strength=1.0)
+
+
+# Keys the backend stages for an ia2v job: runpod-inputs/<job uuid>/image.<ext>
+# and .../audio.<ext>. job ids are UUIDs (every top-level folder of the live
+# bucket that matched a jobs.id was UUID-named). Matched with fullmatch so a
+# trailing newline or extra path segment cannot slip through; no URL, "..", or
+# other prefix can ever match, which is what keeps the worker from fetching
+# anything the caller names.
+_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+IMAGE_KEY_PATTERN = re.compile(rf"runpod-inputs/({_UUID})/image\.(?:jpg|png|webp)")
+AUDIO_KEY_PATTERN = re.compile(rf"runpod-inputs/({_UUID})/audio\.(?:mp3|wav)")
+
+
 @dataclass(frozen=True)
 class GenerationRequest:
     prompt: str
     duration: float
     width: int
     height: int
+    image_key: str | None = None
+    audio_key: str | None = None
+
+    @property
+    def mode(self) -> str:
+        return "ia2v" if self.image_key is not None else "t2v"
+
+
+def _validated_key(job_input: dict, field: str, pattern: re.Pattern) -> re.Match:
+    value = job_input[field]
+    match = pattern.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(f"{field} is not a valid staged input key")
+    return match
 
 
 def validate_input(job_input: dict) -> GenerationRequest:
-    allowed_keys = {"prompt", "duration", "aspect_ratio"}
+    allowed_keys = {"prompt", "duration", "aspect_ratio", "image_key", "audio_key"}
     if set(job_input.keys()) - allowed_keys:
         raise ValueError(f"unexpected fields: {set(job_input.keys()) - allowed_keys}")
     if "prompt" not in job_input or not isinstance(job_input["prompt"], str) or not job_input["prompt"].strip():
@@ -139,8 +249,24 @@ def validate_input(job_input: dict) -> GenerationRequest:
     if not isinstance(aspect_ratio, str) or aspect_ratio not in ASPECT_RATIO_DIMENSIONS:
         raise ValueError(f"aspect_ratio must be one of {sorted(ASPECT_RATIO_DIMENSIONS)}")
     width, height = ASPECT_RATIO_DIMENSIONS[aspect_ratio]
+
+    image_key = audio_key = None
+    if ("image_key" in job_input) != ("audio_key" in job_input):
+        raise ValueError("image_key and audio_key must be provided together")
+    if "image_key" in job_input:
+        image_match = _validated_key(job_input, "image_key", IMAGE_KEY_PATTERN)
+        audio_match = _validated_key(job_input, "audio_key", AUDIO_KEY_PATTERN)
+        if image_match.group(1) != audio_match.group(1):
+            raise ValueError("image_key and audio_key must be in the same job folder")
+        image_key, audio_key = job_input["image_key"], job_input["audio_key"]
+
     return GenerationRequest(
-        prompt=job_input["prompt"], duration=duration, width=width, height=height
+        prompt=job_input["prompt"],
+        duration=duration,
+        width=width,
+        height=height,
+        image_key=image_key,
+        audio_key=audio_key,
     )
 
 
@@ -201,6 +327,45 @@ def _generate_video(request: GenerationRequest) -> bytes:
         os.remove(output_path)
 
 
+def _generate_ia2v_video(request: GenerationRequest) -> bytes:
+    pipeline = load_a2v_pipeline()
+    # Same helper as t2v: snap_frames_to_grid floors, which would leave a
+    # whole-second clip 0.29s short (see _frames_for_duration).
+    num_frames = _frames_for_duration(request.duration)
+
+    with tempfile.TemporaryDirectory() as workdir:
+        image_path = os.path.join(workdir, "image" + os.path.splitext(request.image_key)[1])
+        audio_path = os.path.join(workdir, "audio" + os.path.splitext(request.audio_key)[1])
+        output_path = os.path.join(workdir, "out.mp4")
+        _download_from_r2(request.image_key, image_path)
+        _download_from_r2(request.audio_key, audio_path)
+
+        # no_grad, not inference_mode: see the comment in _generate_video.
+        with torch.no_grad():
+            result = pipeline(
+                prompt=request.prompt,
+                seed=int.from_bytes(os.urandom(4), "big"),
+                height=request.height,
+                width=request.width,
+                frame_rate=FPS,
+                num_frames=num_frames,
+                images=[_image_conditioning(image_path)],
+                audio_path=audio_path,
+                **A2V_CALL_KWARGS,
+            )
+            # result.audio is the INPUT audio passed through (docs/pipelines.md
+            # of ltx-pipelines), which is what a lip-synced clip must carry.
+            encode_video(
+                video=result.video,
+                fps=FPS,
+                audio=result.audio,
+                output_path=output_path,
+                video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
+            )
+        with open(output_path, "rb") as f:
+            return f.read()
+
+
 def handler(job: dict) -> dict:
     try:
         request = validate_input(job.get("input", {}))
@@ -210,8 +375,11 @@ def handler(job: dict) -> dict:
     if _is_blocked(request.prompt):
         return {"error": "prompt rejected by moderation"}
 
-    video_bytes = _generate_video(request)
-    key = f"clips/{uuid.uuid4().hex}.mp4"
+    if request.mode == "ia2v":
+        video_bytes = _generate_ia2v_video(request)
+    else:
+        video_bytes = _generate_video(request)
+    key =f"clips/{uuid.uuid4().hex}.mp4"
     # Uploaded directly from the worker rather than returned as bytes_b64:
     # RunPod's own /job-done callback rejects a full HD video base64-encoded
     # into the job result with a 400 (exceeds RunPod's sync result size

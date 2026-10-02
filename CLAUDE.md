@@ -100,6 +100,27 @@ image) via `ltx_pipelines.distilled.DistilledPipeline`, with
 Each worker has its own `Dockerfile` and is meant to connect directly to
 RunPod for auto-build-on-push rather than share a base image.
 
+**worker-video ia2v mode (image + audio to lip-synced video) is implemented
+but UNVERIFIED on real hardware.** Input is
+`{prompt, image_key, audio_key, duration, aspect_ratio}`; both keys are
+required together, must match `runpod-inputs/<uuid>/image.(jpg|png|webp)` and
+`runpod-inputs/<uuid>/audio.(mp3|wav)` (`fullmatch`, same `<uuid>` folder), and
+no URL is ever accepted, which preserves the SSRF rule. The worker downloads
+them from R2 with a separate read credential, so the endpoint also needs
+`R2_READ_KEY` and `R2_READ_SECRET` (alongside `R2_WRITE_*`, `R2_ENDPOINT`,
+`R2_BUCKET`). `A2VidPipelineTwoStage` is imported and loaded lazily on the first
+ia2v request (guarded by the same double-checked lock), so a t2v-only worker
+never loads it. What is NOT known: the A2Vid spike
+(`docs/superpowers/spikes/a2vid-spike-runbook.md`) has not been run, so
+`A2V_CALL_KWARGS`, `_a2v_pipeline_kwargs()` (the `distilled_lora` constructor
+kwarg) and the `ImageConditioningInput` import in `handler.py` are placeholders
+marked `UNVERIFIED`, not proven values; whether the 2.5 distilled transformer
+works as the A2Vid stage-1 checkpoint, whether it fits next to the
+`DistilledPipeline` in one worker, and whether it runs on a Blackwell card are
+all unanswered. The `Dockerfile` still clones LTX-2 unpinned (no commit SHA has
+been proven to work). `worker-video/spike/` is throwaway and must be deleted
+before this branch merges.
+
 **GPU sizing for worker-video is tight even with CPU offload.** The 22B
 transformer + 12B text encoder alone are >60GB combined at bf16 before VAEs
 and activations; a 32GB card OOMs even with offload enabled per the comment

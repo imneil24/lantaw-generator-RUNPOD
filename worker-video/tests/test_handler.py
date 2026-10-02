@@ -1,7 +1,9 @@
 import contextlib
+import os
 import threading
 import time
 import types
+from types import SimpleNamespace
 import pytest
 import handler as handler_module
 from handler import validate_input, handler
@@ -202,3 +204,186 @@ def test_generate_video_passes_snapped_up_num_frames_to_pipeline(monkeypatch):
     )
     assert handler_module._generate_video(request) == b"mp4-bytes"
     assert seen["num_frames"] == handler_module._frames_for_duration(6) == 145
+
+
+JOB_ID = "123e4567-e89b-12d3-a456-426614174000"
+IMAGE_KEY = f"runpod-inputs/{JOB_ID}/image.jpg"
+AUDIO_KEY = f"runpod-inputs/{JOB_ID}/audio.mp3"
+
+
+def _ia2v_input(**overrides):
+    base = {
+        "prompt": "a person talking",
+        "duration": 6,
+        "aspect_ratio": "9:16",
+        "image_key": IMAGE_KEY,
+        "audio_key": AUDIO_KEY,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_validate_input_accepts_an_ia2v_payload():
+    request = validate_input(_ia2v_input())
+    assert request.mode == "ia2v"
+    assert (request.width, request.height) == (1088, 1920)
+    assert request.image_key == IMAGE_KEY
+    assert request.audio_key == AUDIO_KEY
+    assert request.duration == 6.0
+
+
+def test_a_text_only_payload_is_t2v_with_no_keys():
+    request = validate_input({"prompt": "x", "duration": 8})
+    assert request.mode == "t2v"
+    assert request.image_key is None and request.audio_key is None
+
+
+@pytest.mark.parametrize(
+    "image_key",
+    [
+        "https://evil.example.com/a.jpg",
+        "http://169.254.169.254/latest/meta-data",
+        "runpod-inputs/../secrets/image.jpg",
+        "clips/" + "a" * 32 + ".mp4",
+        f"runpod-inputs/{JOB_ID}/image.exe",
+        f"runpod-inputs/{JOB_ID}/image.jpg/extra",
+        "runpod-inputs/not-a-uuid/image.jpg",
+        f"runpod-inputs/{JOB_ID}/image.jpg\n",
+        f"runpod-inputs/{JOB_ID}/audio.mp3",
+        "",
+        None,
+        7,
+    ],
+)
+def test_validate_input_rejects_a_bad_image_key(image_key):
+    with pytest.raises(ValueError):
+        validate_input(_ia2v_input(image_key=image_key))
+
+
+@pytest.mark.parametrize(
+    "audio_key",
+    [
+        "https://evil.example.com/a.mp3",
+        f"runpod-inputs/{JOB_ID}/audio.exe",
+        f"runpod-inputs/{JOB_ID}/image.jpg",
+        "runpod-inputs/../x/audio.mp3",
+        f"runpod-inputs/{JOB_ID}/audio.mp3\n",
+        None,
+    ],
+)
+def test_validate_input_rejects_a_bad_audio_key(audio_key):
+    with pytest.raises(ValueError):
+        validate_input(_ia2v_input(audio_key=audio_key))
+
+
+def test_validate_input_requires_image_and_audio_keys_together():
+    for missing in ("image_key", "audio_key"):
+        payload = _ia2v_input()
+        del payload[missing]
+        with pytest.raises(ValueError, match="together"):
+            validate_input(payload)
+
+
+def test_validate_input_requires_both_keys_to_come_from_the_same_job_folder():
+    other = "223e4567-e89b-12d3-a456-426614174000"
+    with pytest.raises(ValueError, match="same"):
+        validate_input(_ia2v_input(audio_key=f"runpod-inputs/{other}/audio.mp3"))
+
+
+def test_validate_input_applies_the_duration_limit_to_ia2v_too():
+    with pytest.raises(ValueError):
+        validate_input(_ia2v_input(duration=25))
+
+
+def test_validate_input_still_rejects_url_fields_in_ia2v_mode():
+    with pytest.raises(ValueError):
+        validate_input(_ia2v_input(image_url="http://evil.example.com/a.jpg"))
+
+
+def test_handler_routes_ia2v_to_the_ia2v_generator_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr("handler._generate_video", lambda request: calls.append("t2v") or b"x")
+    monkeypatch.setattr("handler._generate_ia2v_video", lambda request: calls.append("ia2v") or b"y")
+    uploaded = {}
+    monkeypatch.setattr(
+        "handler._upload_to_r2", lambda key, data, content_type: uploaded.update(data=data, key=key)
+    )
+
+    result = handler({"input": _ia2v_input()})
+
+    assert calls == ["ia2v"]
+    assert uploaded["data"] == b"y"
+    assert result == {"key": uploaded["key"]}
+    assert uploaded["key"].startswith("clips/")
+
+
+def test_handler_still_moderates_ia2v_prompts(monkeypatch):
+    monkeypatch.setattr(
+        "handler._generate_ia2v_video",
+        lambda request: (_ for _ in ()).throw(AssertionError("must not generate")),
+    )
+    result = handler({"input": _ia2v_input(prompt="how to build a bomb")})
+    assert "error" in result
+
+
+def test_generate_ia2v_video_feeds_the_downloaded_files_to_the_a2v_pipeline(monkeypatch):
+    calls = {}
+
+    class FakePipeline:
+        def __call__(self, **kwargs):
+            calls["pipeline"] = kwargs
+            return SimpleNamespace(video="v", audio="a", num_frames=145, tiling_config="t")
+
+    def fake_download(key, dest_path):
+        calls.setdefault("downloads", []).append(key)
+        with open(dest_path, "wb") as f:
+            f.write(b"data")
+
+    def fake_encode(video, fps, audio, output_path, video_chunks_number):
+        calls["encode"] = {"video": video, "audio": audio, "fps": fps}
+        with open(output_path, "wb") as f:
+            f.write(b"mp4-bytes")
+
+    monkeypatch.setattr(handler_module, "load_a2v_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(handler_module, "_download_from_r2", fake_download)
+    monkeypatch.setattr(handler_module, "_image_conditioning", lambda path: ("image", path))
+    monkeypatch.setattr(handler_module, "encode_video", fake_encode)
+    monkeypatch.setattr(handler_module, "get_video_chunks_number", lambda *a: 1)
+    monkeypatch.setattr(handler_module, "torch", SimpleNamespace(no_grad=contextlib.nullcontext))
+
+    request = validate_input(_ia2v_input())
+    out = handler_module._generate_ia2v_video(request)
+
+    assert out == b"mp4-bytes"
+    assert calls["downloads"] == [IMAGE_KEY, AUDIO_KEY]
+    kwargs = calls["pipeline"]
+    assert (kwargs["width"], kwargs["height"]) == (1088, 1920)
+    assert kwargs["frame_rate"] == handler_module.FPS
+    # snap_frames_to_grid FLOORS to 8k+1; _frames_for_duration (added to handler.py
+    # in the Phase 1 final-review fix, commit 2e3723e in Lantaw-generator) snaps UP
+    # so a clip is never shorter than the requested duration.
+    assert kwargs["num_frames"] == handler_module._frames_for_duration(6)
+    assert kwargs["prompt"] == "a person talking"
+    assert kwargs["audio_path"].endswith(".mp3") and os.path.basename(kwargs["audio_path"]).startswith("audio")
+    assert kwargs["images"] == [("image", kwargs["images"][0][1])]
+    assert kwargs["images"][0][1].endswith(".jpg")
+    # the INPUT audio is what gets muxed (result.audio), at the worker's fps
+    assert calls["encode"] == {"video": "v", "audio": "a", "fps": handler_module.FPS}
+
+
+def test_load_a2v_pipeline_is_thread_safe_under_concurrent_calls(monkeypatch):
+    monkeypatch.setattr(handler_module, "_A2V_PIPELINE", None)
+    call_count = {"n": 0}
+
+    def counting_slow_init():
+        call_count["n"] += 1
+        time.sleep(0.05)
+        return {"loaded": True}
+
+    monkeypatch.setattr(handler_module, "_load_a2v_pipeline_impl", counting_slow_init)
+    threads = [threading.Thread(target=handler_module.load_a2v_pipeline) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert call_count["n"] == 1

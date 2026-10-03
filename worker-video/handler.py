@@ -1,10 +1,11 @@
+import logging
 import math
 import os
 import re
 import tempfile
 import threading
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import boto3
 import torch
@@ -43,6 +44,49 @@ VIDEO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-video-vae-bf16.safetensors"
 AUDIO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-audio-vae-bf16.safetensors"
 SPATIAL_UPSAMPLER_PATH = f"{MODEL_ROOT}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
 
+logger = logging.getLogger("worker-video")
+
+# Optional avatar (A2V) tuning, all read at call time. UNSET means the behaviour
+# is exactly what it was before these existed, so deploying this changes nothing
+# until a variable is set on the RunPod endpoint. Set them to A/B test the
+# avatar's unnatural expression and weak lip sync without a code change:
+#   A2V_TRANSFORMER_PATH        base transformer for the avatar pipeline (default
+#                               TRANSFORMER_PATH, the DISTILLED weights)
+#   A2V_DISTILLED_LORA_PATH     distilled LoRA for stage 2 (default none)
+#   A2V_DISTILLED_LORA_STRENGTH its strength (default 1.0, the library's default)
+#   A2V_NUM_INFERENCE_STEPS     stage 1 steps (default from detect_params)
+#   A2V_CFG_SCALE               video CFG (text guidance) scale
+#   A2V_STG_SCALE               video STG scale (0 disables)
+#   A2V_RESCALE_SCALE           video rescale scale (limits over-saturation)
+#   A2V_MODALITY_SCALE          audio-to-video modality scale (lip sync; 1.0 off)
+# The meaning of the four guidance values is from the LTX-2 library's
+# docs/multimodal-guidance.md (Lightricks/LTX-2 main). Good VALUES for this
+# model are not known: they need short test clips.
+_A2V_FLOAT_VARS = {
+    "A2V_CFG_SCALE": "cfg_scale",
+    "A2V_STG_SCALE": "stg_scale",
+    "A2V_RESCALE_SCALE": "rescale_scale",
+    "A2V_MODALITY_SCALE": "modality_scale",
+}
+
+
+def _env_float(name: str) -> float | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number, got {raw!r}") from None
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite number >= 0, got {raw!r}")
+    return value
+
+
+def _a2v_transformer_path() -> str:
+    return os.environ.get("A2V_TRANSFORMER_PATH", "").strip() or TRANSFORMER_PATH
+
+
 def _a2v_call_kwargs() -> dict:
     # Extra required args of A2VidPipelineTwoStage.__call__ beyond
     # prompt/seed/height/width/frame_rate/num_frames/images/audio_path. The
@@ -59,20 +103,53 @@ def _a2v_call_kwargs() -> dict:
     # Imported lazily (like _image_conditioning) so tests run without the library.
     from ltx_pipelines.utils.constants import DEFAULT_NEGATIVE_PROMPT, detect_params
 
-    params = detect_params(TRANSFORMER_PATH)
+    params = detect_params(_a2v_transformer_path())
+    steps = params.num_inference_steps
+    guider = params.video_guider_params
+
+    steps_override = _env_float("A2V_NUM_INFERENCE_STEPS")
+    if steps_override is not None:
+        if steps_override < 1 or steps_override != int(steps_override):
+            raise ValueError(f"A2V_NUM_INFERENCE_STEPS must be a whole number >= 1, got {steps_override}")
+        steps = int(steps_override)
+    guider_overrides = {
+        field: value for name, field in _A2V_FLOAT_VARS.items() if (value := _env_float(name)) is not None
+    }
+    if guider_overrides:
+        guider = replace(guider, **guider_overrides)
+
+    # Logged on every call so the values a clip was really made with can be read
+    # from the endpoint's logs, not inferred from code.
+    logger.info(
+        "A2V settings: transformer=%s steps=%s guider=%s",
+        _a2v_transformer_path(), steps, guider,
+    )
     return {
         "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
-        "num_inference_steps": params.num_inference_steps,
-        "video_guider_params": params.video_guider_params,
+        "num_inference_steps": steps,
+        "video_guider_params": guider,
     }
 
 
 def _a2v_pipeline_kwargs() -> dict:
-    # UNVERIFIED placeholder: extra
-    # constructor kwargs from the findings doc's "Working call" (the
-    # distilled_lora value, [] when none is required). The spike has not run,
-    # so whether a distilled LoRA is needed at all is not known.
-    return {"distilled_lora": []}
+    # distilled_lora: the avatar pipeline's stage 2 applies a distilled LoRA on
+    # top of the base model (library docs/pipelines.md section 7). It was []
+    # (none), and still is unless A2V_DISTILLED_LORA_PATH is set. Whether a LoRA
+    # is needed with these (distilled) base weights is not known; the spike has
+    # not run.
+    path = os.environ.get("A2V_DISTILLED_LORA_PATH", "").strip()
+    if not path:
+        return {"distilled_lora": []}
+    strength = _env_float("A2V_DISTILLED_LORA_STRENGTH")
+    if not os.path.isfile(path):
+        raise ValueError(f"A2V_DISTILLED_LORA_PATH does not exist: {path!r}")
+    from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+
+    return {
+        "distilled_lora": [
+            LoraPathStrengthAndSDOps(path, 1.0 if strength is None else strength, LTXV_LORA_COMFY_RENAMING_MAP)
+        ]
+    }
 
 
 # Mirrors backend/app/moderation.py's DEFAULT_BLOCKLIST. The RunPod endpoint
@@ -180,7 +257,7 @@ def _load_a2v_pipeline_impl():
     from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
 
     model_paths = ModelPaths.from_split(
-        transformer_path=TRANSFORMER_PATH,
+        transformer_path=_a2v_transformer_path(),
         text_encoder_path=TEXT_ENCODER_PATH,
         video_vae_path=VIDEO_VAE_PATH,
         audio_vae_path=AUDIO_VAE_PATH,

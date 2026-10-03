@@ -416,3 +416,122 @@ def test_load_a2v_pipeline_is_thread_safe_under_concurrent_calls(monkeypatch):
     for t in threads:
         t.join()
     assert call_count["n"] == 1
+
+
+# --- optional avatar (A2V) tuning via env vars --------------------------------
+# Unset means unchanged behaviour; set means A/B test the avatar's expression and
+# lip sync without a code change. The guidance meanings come from the LTX-2
+# library's docs/multimodal-guidance.md; good values for this model are unknown.
+
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class _Guider:
+    # Same field names as ltx_core.components.guiders.MultiModalGuiderParams.
+    cfg_scale: float = 3.0
+    stg_scale: float = 1.0
+    rescale_scale: float = 0.7
+    modality_scale: float = 3.0
+    skip_step: int = 0
+    stg_blocks: list = field(default_factory=lambda: [28])
+
+
+def _fake_constants(monkeypatch, seen=None):
+    def fake_detect_params(checkpoint_path):
+        if seen is not None:
+            seen["checkpoint_path"] = checkpoint_path
+        return SimpleNamespace(num_inference_steps=30, video_guider_params=_Guider())
+
+    fake = types.ModuleType("ltx_pipelines.utils.constants")
+    fake.detect_params = fake_detect_params
+    fake.DEFAULT_NEGATIVE_PROMPT = "N"
+    monkeypatch.setitem(sys.modules, "ltx_pipelines.utils.constants", fake)
+
+
+_A2V_ENV = (
+    "A2V_TRANSFORMER_PATH", "A2V_DISTILLED_LORA_PATH", "A2V_DISTILLED_LORA_STRENGTH",
+    "A2V_NUM_INFERENCE_STEPS", "A2V_CFG_SCALE", "A2V_STG_SCALE", "A2V_RESCALE_SCALE", "A2V_MODALITY_SCALE",
+)
+
+
+@pytest.fixture
+def clean_a2v_env(monkeypatch):
+    for name in _A2V_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_a2v_defaults_are_unchanged_when_no_env_var_is_set(monkeypatch, clean_a2v_env):
+    seen = {}
+    _fake_constants(monkeypatch, seen)
+
+    kwargs = handler_module._a2v_call_kwargs()
+
+    assert kwargs["num_inference_steps"] == 30 and kwargs["video_guider_params"] == _Guider()
+    assert seen["checkpoint_path"] == handler_module.TRANSFORMER_PATH
+    assert handler_module._a2v_pipeline_kwargs() == {"distilled_lora": []}
+
+
+def test_a2v_guidance_env_vars_override_only_the_fields_that_are_set(monkeypatch, clean_a2v_env):
+    _fake_constants(monkeypatch)
+    monkeypatch.setenv("A2V_CFG_SCALE", "2.0")
+    monkeypatch.setenv("A2V_MODALITY_SCALE", "4.5")
+    monkeypatch.setenv("A2V_NUM_INFERENCE_STEPS", "20")
+
+    kwargs = handler_module._a2v_call_kwargs()
+
+    guider = kwargs["video_guider_params"]
+    assert (guider.cfg_scale, guider.modality_scale) == (2.0, 4.5)
+    # untouched fields keep the library's values
+    assert (guider.stg_scale, guider.rescale_scale, guider.stg_blocks) == (1.0, 0.7, [28])
+    assert kwargs["num_inference_steps"] == 20
+
+
+def test_a2v_transformer_override_is_used_for_param_detection(monkeypatch, clean_a2v_env):
+    seen = {}
+    _fake_constants(monkeypatch, seen)
+    monkeypatch.setenv("A2V_TRANSFORMER_PATH", "/runpod-volume/ltx-2.5/dev.safetensors")
+
+    handler_module._a2v_call_kwargs()
+
+    # detect_params must read the SAME checkpoint the pipeline loads, or the
+    # steps and guidance would follow the wrong model generation.
+    assert seen["checkpoint_path"] == "/runpod-volume/ltx-2.5/dev.safetensors"
+    assert handler_module._a2v_transformer_path() == "/runpod-volume/ltx-2.5/dev.safetensors"
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("A2V_CFG_SCALE", "abc"), ("A2V_CFG_SCALE", "-1"), ("A2V_CFG_SCALE", "nan"), ("A2V_CFG_SCALE", "inf"),
+        ("A2V_NUM_INFERENCE_STEPS", "0"), ("A2V_NUM_INFERENCE_STEPS", "7.5"), ("A2V_MODALITY_SCALE", "x"),
+    ],
+)
+def test_a2v_bad_env_values_fail_loudly_naming_the_variable(monkeypatch, clean_a2v_env, name, value):
+    # A typo must not silently fall back to a default: the clip would be made
+    # with settings the operator did not intend and never find out.
+    _fake_constants(monkeypatch)
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=name):
+        handler_module._a2v_call_kwargs()
+
+
+def test_a2v_distilled_lora_env_builds_the_library_lora_tuple(monkeypatch, clean_a2v_env, tmp_path):
+    lora = tmp_path / "distilled-lora.safetensors"
+    lora.write_bytes(b"x")
+    loader = types.ModuleType("ltx_core.loader")
+    loader.LTXV_LORA_COMFY_RENAMING_MAP = "RENAMING"
+    loader.LoraPathStrengthAndSDOps = lambda path, strength, sd_ops: (path, strength, sd_ops)
+    monkeypatch.setitem(sys.modules, "ltx_core.loader", loader)
+    monkeypatch.setenv("A2V_DISTILLED_LORA_PATH", str(lora))
+    monkeypatch.setenv("A2V_DISTILLED_LORA_STRENGTH", "0.8")
+
+    assert handler_module._a2v_pipeline_kwargs() == {"distilled_lora": [(str(lora), 0.8, "RENAMING")]}
+
+
+def test_a2v_distilled_lora_path_that_does_not_exist_fails_loudly(monkeypatch, clean_a2v_env):
+    monkeypatch.setenv("A2V_DISTILLED_LORA_PATH", "/runpod-volume/missing.safetensors")
+
+    with pytest.raises(ValueError, match="A2V_DISTILLED_LORA_PATH"):
+        handler_module._a2v_pipeline_kwargs()

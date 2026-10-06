@@ -1,8 +1,10 @@
+import glob
 import math
 import os
 import re
 import tempfile
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -36,12 +38,90 @@ FPS = 24
 FRAME_GRID_STEP = 8
 FAST_MAX_DURATION = 20
 
-MODEL_ROOT = "/runpod-volume/ltx-2.5"
-TRANSFORMER_PATH = f"{MODEL_ROOT}/diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
-TEXT_ENCODER_PATH = f"{MODEL_ROOT}/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
-VIDEO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-video-vae-bf16.safetensors"
-AUDIO_VAE_PATH = f"{MODEL_ROOT}/vae/ltx-2.5-audio-vae-bf16.safetensors"
-SPATIAL_UPSAMPLER_PATH = f"{MODEL_ROOT}/latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+# Weights come from RunPod's "Cached model" feature (Lightricks/LTX-2.5), which
+# mounts the HF hub cache under /runpod-volume/huggingface-cache. The snapshot
+# folder name is a commit hash unknown at build time, so it is globbed at
+# runtime. Files inside are symlinks into blobs/ (normal for the HF cache); do
+# not realpath them. The HF token lives in the endpoint settings, not here.
+SNAPSHOT_GLOB = "/runpod-volume/huggingface-cache/hub/models--Lightricks--LTX-2.5/snapshots/*"
+
+_TRANSFORMER_REL = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safetensors"
+_TEXT_ENCODER_REL = "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
+_VIDEO_VAE_REL = "vae/ltx-2.5-video-vae-bf16.safetensors"
+_AUDIO_VAE_REL = "vae/ltx-2.5-audio-vae-bf16.safetensors"
+_SPATIAL_UPSAMPLER_REL = "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+_REQUIRED_MODEL_FILES = (
+    _TRANSFORMER_REL, _TEXT_ENCODER_REL, _VIDEO_VAE_REL, _AUDIO_VAE_REL, _SPATIAL_UPSAMPLER_REL,
+)
+
+# Set by init_model_paths() at worker startup, not at import: importing this
+# module (unit tests, tooling) must not block waiting for a GPU worker's cache.
+MODEL_ROOT = None
+TRANSFORMER_PATH = None
+TEXT_ENCODER_PATH = None
+VIDEO_VAE_PATH = None
+AUDIO_VAE_PATH = None
+SPATIAL_UPSAMPLER_PATH = None
+_MODEL_PATHS_LOCK = threading.Lock()
+
+
+def _missing_model_files(root: str) -> list[str]:
+    # isfile follows symlinks, so a dangling blob link counts as missing.
+    return [rel for rel in _REQUIRED_MODEL_FILES if not os.path.isfile(f"{root}/{rel}")]
+
+
+def resolve_model_root(timeout: float = 600, poll_interval: float = 5) -> str:
+    """Return the cached LTX-2.5 snapshot folder that holds every required file.
+
+    Polls because the cache can mount before it is fully populated. Waiting for
+    the files (not just the folder) means a half-populated snapshot is retried
+    instead of failing later, deep inside the weight loader.
+    """
+    deadline = time.monotonic() + timeout
+    incomplete: dict[str, list[str]] = {}
+    while True:
+        incomplete = {}
+        for snapshot in sorted(glob.glob(SNAPSHOT_GLOB)):
+            missing = _missing_model_files(snapshot)
+            if not missing:
+                return snapshot
+            incomplete[snapshot] = missing
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(poll_interval)
+    if incomplete:
+        raise RuntimeError(
+            f"LTX-2.5 cached model is incomplete (missing files per snapshot: {incomplete}); "
+            "check the Cached model setting and HF token"
+        )
+    raise RuntimeError(
+        f"LTX-2.5 cached model not found (no folder matches {SNAPSHOT_GLOB}); "
+        "check Cached model setting and HF token"
+    )
+
+
+def init_model_paths() -> str:
+    global MODEL_ROOT, TRANSFORMER_PATH, TEXT_ENCODER_PATH, VIDEO_VAE_PATH
+    global AUDIO_VAE_PATH, SPATIAL_UPSAMPLER_PATH
+    root = resolve_model_root()
+    MODEL_ROOT = root
+    TRANSFORMER_PATH = f"{root}/{_TRANSFORMER_REL}"
+    TEXT_ENCODER_PATH = f"{root}/{_TEXT_ENCODER_REL}"
+    VIDEO_VAE_PATH = f"{root}/{_VIDEO_VAE_REL}"
+    AUDIO_VAE_PATH = f"{root}/{_AUDIO_VAE_REL}"
+    SPATIAL_UPSAMPLER_PATH = f"{root}/{_SPATIAL_UPSAMPLER_REL}"
+    print(f"MODEL_ROOT={MODEL_ROOT}")
+    return root
+
+
+def _ensure_model_paths() -> None:
+    # Idempotent; the pipeline loaders call it so they are safe even if
+    # startup() was skipped.
+    if MODEL_ROOT is None:
+        with _MODEL_PATHS_LOCK:
+            if MODEL_ROOT is None:
+                init_model_paths()
+
 
 def _a2v_call_kwargs() -> dict:
     # Extra required args of A2VidPipelineTwoStage.__call__ beyond
@@ -138,6 +218,7 @@ def _download_from_r2(key: str, dest_path: str) -> None:
 
 
 def _load_pipeline_impl() -> DistilledPipeline:
+    _ensure_model_paths()
     model_paths = ModelPaths.from_split(
         transformer_path=TRANSFORMER_PATH,
         text_encoder_path=TEXT_ENCODER_PATH,
@@ -170,6 +251,15 @@ def load_pipeline() -> DistilledPipeline:
     return _PIPELINE
 
 
+def startup() -> None:
+    # Called once by the container CMD before runpod.serverless.start, so the
+    # cache wait and the slow weight load happen at cold start rather than on
+    # the first request. The A2Vid pipeline stays lazy (see
+    # _load_a2v_pipeline_impl): a t2v-only worker never loads it.
+    init_model_paths()
+    load_pipeline()
+
+
 _A2V_PIPELINE = None
 _A2V_PIPELINE_LOCK = threading.Lock()
 
@@ -179,6 +269,7 @@ def _load_a2v_pipeline_impl():
     # tests never need the A2Vid module; a t2v-only worker never loads it.
     from ltx_pipelines.a2vid_two_stage import A2VidPipelineTwoStage
 
+    _ensure_model_paths()
     model_paths = ModelPaths.from_split(
         transformer_path=TRANSFORMER_PATH,
         text_encoder_path=TEXT_ENCODER_PATH,

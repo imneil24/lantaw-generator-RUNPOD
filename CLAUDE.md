@@ -94,8 +94,9 @@ model once into a module-global on cold start (guarded by a lock against
 concurrent cold-start races on a warm RunPod worker), and validate input
 strictly. `worker-video/handler.py` loads LTX-2.5's 22B distilled transformer
 (bf16) plus a Gemma-3-12B text encoder, video/audio VAEs, and a spatial
-upsampler from `/runpod-volume/ltx-2.5` (weights are not baked into the
-image) via `ltx_pipelines.distilled.DistilledPipeline`, with
+upsampler from RunPod's "Cached model" (`Lightricks/LTX-2.5`, mounted under
+`/runpod-volume/huggingface-cache`; `init_model_paths()` globs the snapshot
+folder at startup — weights are not baked into the image) via `ltx_pipelines.distilled.DistilledPipeline`, with
 `OffloadMode.CPU` — `OffloadMode.NONE` was confirmed to OOM on a 32GB card.
 Each worker has its own `Dockerfile` and is meant to connect directly to
 RunPod for auto-build-on-push rather than share a base image.

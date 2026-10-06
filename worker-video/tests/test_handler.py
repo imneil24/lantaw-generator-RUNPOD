@@ -391,13 +391,84 @@ def test_a2v_call_kwargs_come_from_the_librarys_detect_params(monkeypatch):
     fake_constants.detect_params = fake_detect_params
     fake_constants.DEFAULT_NEGATIVE_PROMPT = "N"
     monkeypatch.setitem(sys.modules, "ltx_pipelines.utils.constants", fake_constants)
+    monkeypatch.setattr(handler_module, "TRANSFORMER_PATH", "/cache/snap/transformer.safetensors")
 
     assert handler_module._a2v_call_kwargs() == {
         "negative_prompt": "N",
         "num_inference_steps": 30,
         "video_guider_params": "G",
     }
-    assert seen["checkpoint_path"] == handler_module.TRANSFORMER_PATH
+    assert seen["checkpoint_path"] == "/cache/snap/transformer.safetensors"
+
+
+def _make_snapshot(snapshots_dir, name, skip=()):
+    snapshot = snapshots_dir / name
+    for rel in handler_module._REQUIRED_MODEL_FILES:
+        if rel in skip:
+            continue
+        path = snapshot / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    return snapshot
+
+
+def test_resolve_model_root_returns_the_snapshot_holding_every_file(monkeypatch, tmp_path):
+    snapshots = tmp_path / "snapshots"
+    monkeypatch.setattr(handler_module, "SNAPSHOT_GLOB", str(snapshots / "*"))
+    _make_snapshot(snapshots, "aaa", skip=(handler_module._VIDEO_VAE_REL,))
+    complete = _make_snapshot(snapshots, "bbb")
+
+    assert handler_module.resolve_model_root(timeout=0) == str(complete)
+
+
+def test_resolve_model_root_fails_clearly_when_cache_is_absent(monkeypatch, tmp_path):
+    monkeypatch.setattr(handler_module, "SNAPSHOT_GLOB", str(tmp_path / "snapshots" / "*"))
+
+    with pytest.raises(RuntimeError, match="cached model not found"):
+        handler_module.resolve_model_root(timeout=0)
+
+
+def test_resolve_model_root_names_the_missing_file(monkeypatch, tmp_path):
+    snapshots = tmp_path / "snapshots"
+    monkeypatch.setattr(handler_module, "SNAPSHOT_GLOB", str(snapshots / "*"))
+    _make_snapshot(snapshots, "aaa", skip=(handler_module._AUDIO_VAE_REL,))
+
+    with pytest.raises(RuntimeError, match="ltx-2.5-audio-vae-bf16"):
+        handler_module.resolve_model_root(timeout=0)
+
+
+def test_resolve_model_root_waits_for_a_late_cache_mount(monkeypatch, tmp_path):
+    snapshots = tmp_path / "snapshots"
+    monkeypatch.setattr(handler_module, "SNAPSHOT_GLOB", str(snapshots / "*"))
+    sleeps = []
+
+    def populate_on_first_sleep(seconds):
+        sleeps.append(seconds)
+        _make_snapshot(snapshots, "late")
+
+    monkeypatch.setattr(handler_module.time, "sleep", populate_on_first_sleep)
+
+    assert handler_module.resolve_model_root(timeout=60, poll_interval=1) == str(snapshots / "late")
+    assert sleeps == [1]
+
+
+def test_init_model_paths_builds_every_checkpoint_path_from_the_snapshot(monkeypatch, tmp_path):
+    snapshots = tmp_path / "snapshots"
+    monkeypatch.setattr(handler_module, "SNAPSHOT_GLOB", str(snapshots / "*"))
+    snapshot = _make_snapshot(snapshots, "abc123")
+    for name in ("MODEL_ROOT", "TRANSFORMER_PATH", "TEXT_ENCODER_PATH", "VIDEO_VAE_PATH",
+                 "AUDIO_VAE_PATH", "SPATIAL_UPSAMPLER_PATH"):
+        monkeypatch.setattr(handler_module, name, None)
+
+    assert handler_module.init_model_paths() == str(snapshot)
+
+    root = str(snapshot)
+    assert handler_module.MODEL_ROOT == root
+    assert handler_module.TRANSFORMER_PATH == f"{root}/{handler_module._TRANSFORMER_REL}"
+    assert handler_module.TEXT_ENCODER_PATH == f"{root}/{handler_module._TEXT_ENCODER_REL}"
+    assert handler_module.VIDEO_VAE_PATH == f"{root}/{handler_module._VIDEO_VAE_REL}"
+    assert handler_module.AUDIO_VAE_PATH == f"{root}/{handler_module._AUDIO_VAE_REL}"
+    assert handler_module.SPATIAL_UPSAMPLER_PATH == f"{root}/{handler_module._SPATIAL_UPSAMPLER_REL}"
 
 
 def test_load_a2v_pipeline_is_thread_safe_under_concurrent_calls(monkeypatch):

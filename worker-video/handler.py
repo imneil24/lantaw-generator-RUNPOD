@@ -50,6 +50,11 @@ _TRANSFORMER_REL = "diffusion_models/ltx-2.5-22b-distilled-transformer-bf16.safe
 _TEXT_ENCODER_REL = "text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
 _VIDEO_VAE_REL = "vae/ltx-2.5-video-vae-bf16.safetensors"
 _AUDIO_VAE_REL = "vae/ltx-2.5-audio-vae-bf16.safetensors"
+# Optional faster decoder ("Conv VAE ... faster, lighter" in the model card; the
+# default video VAE above is the DiffVAE, "higher quality, heavier"). It is NOT in
+# _REQUIRED_MODEL_FILES: only a worker that opts in with T2V_VIDEO_VAE / A2V_VIDEO_VAE
+# needs it, and that is checked when the pipeline loads.
+_CONV_VIDEO_VAE_REL = "vae/ltx-2.5-video-vae-conv-bf16.safetensors"
 _SPATIAL_UPSAMPLER_REL = "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
 _REQUIRED_MODEL_FILES = (
     _TRANSFORMER_REL, _TEXT_ENCODER_REL, _VIDEO_VAE_REL, _AUDIO_VAE_REL, _SPATIAL_UPSAMPLER_REL,
@@ -232,6 +237,78 @@ def _a2v_pipeline_kwargs() -> dict:
     }
 
 
+# Optional speed options, read when a pipeline is LOADED (not per request). UNSET
+# means exactly the behaviour these pipelines had before, so deploying this changes
+# nothing until a variable is set on the RunPod endpoint. Scoped separately for
+# the b-roll pipeline (T2V_*) and the avatar pipeline (A2V_*), so b-roll can be
+# tried first without touching lip sync:
+#   <T2V|A2V>_VIDEO_VAE      "diff" (default, the heavier higher-quality decoder) or
+#                            "conv" (the model card's "faster, lighter" decoder).
+#                            Needs vae/ltx-2.5-video-vae-conv-bf16.safetensors in the
+#                            cached model; a missing file fails the load by name.
+#   <T2V|A2V>_QUANTIZATION   unset/"none" (default) or "fp8-cast": downcast the bf16
+#                            transformer to FP8 while loading (model card "Low-VRAM
+#                            tips"; ltx_pipelines.utils.quantization_factory).
+#   <T2V|A2V>_OFFLOAD        "cpu" (default, today's behaviour), "none" (all weights on
+#                            the GPU: fastest if it fits, a real OOM was seen on a
+#                            32GB card with bf16) or "disk".
+# Whether any of these is faster on this GPU, and whether FP8 keeps lip sync intact,
+# is NOT known: they need test clips.
+_VIDEO_VAE_CHOICES = ("diff", "conv")
+_QUANTIZATION_CHOICES = ("none", "fp8-cast")
+
+
+def _env_choice(name: str, allowed: tuple[str, ...], default: str) -> str:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw not in allowed:
+        raise ValueError(f"{name} must be one of {', '.join(allowed)}, got {raw!r}")
+    return raw
+
+
+def _video_vae_path_for(prefix: str) -> str:
+    """The video VAE file for the pipeline scoped by `prefix` ("T2V" or "A2V")."""
+    name = f"{prefix}_VIDEO_VAE"
+    if _env_choice(name, _VIDEO_VAE_CHOICES, "diff") == "diff":
+        return VIDEO_VAE_PATH
+    path = f"{MODEL_ROOT}/{_CONV_VIDEO_VAE_REL}"
+    if not os.path.isfile(path):
+        raise RuntimeError(
+            f"{name}=conv needs {_CONV_VIDEO_VAE_REL}, which is not in the cached model "
+            f"({MODEL_ROOT}); add it to the cache or unset {name}"
+        )
+    return path
+
+
+def _quantization_kwargs_for(prefix: str, transformer_path: str) -> dict:
+    """{} (the pipeline's own default) unless <prefix>_QUANTIZATION asks for FP8."""
+    name = f"{prefix}_QUANTIZATION"
+    if _env_choice(name, _QUANTIZATION_CHOICES, "none") == "none":
+        return {}
+    try:
+        from ltx_pipelines.utils.quantization_factory import QuantizationKind
+    except ImportError as exc:
+        raise RuntimeError(
+            f"{name}=fp8-cast needs ltx_pipelines.utils.quantization_factory, which the "
+            f"installed ltx_pipelines does not have; unset {name}"
+        ) from exc
+    return {"quantization": QuantizationKind.FP8_CAST.to_policy(transformer_path)}
+
+
+def _offload_mode_for(prefix: str) -> OffloadMode:
+    return OffloadMode(_env_choice(f"{prefix}_OFFLOAD", ("cpu", "none", "disk"), "cpu"))
+
+
+def _describe_speed_options(prefix: str) -> str:
+    return (
+        f"{prefix} pipeline options: "
+        f"video_vae={os.environ.get(f'{prefix}_VIDEO_VAE', '').strip() or 'diff'} "
+        f"quantization={os.environ.get(f'{prefix}_QUANTIZATION', '').strip() or 'none'} "
+        f"offload={os.environ.get(f'{prefix}_OFFLOAD', '').strip() or 'cpu'}"
+    )
+
+
 # Mirrors backend/app/moderation.py's DEFAULT_BLOCKLIST. The RunPod endpoint
 # is reachable directly with its own Bearer key, independent of the backend
 # proxy — this is a second, independent trust boundary, so moderation must
@@ -299,19 +376,22 @@ def _load_pipeline_impl() -> DistilledPipeline:
     model_paths = ModelPaths.from_split(
         transformer_path=TRANSFORMER_PATH,
         text_encoder_path=TEXT_ENCODER_PATH,
-        video_vae_path=VIDEO_VAE_PATH,
+        video_vae_path=_video_vae_path_for("T2V"),
         audio_vae_path=AUDIO_VAE_PATH,
     )
+    logger.info(_describe_speed_options("T2V"))
     return DistilledPipeline(
         model_paths=model_paths,
         spatial_upsampler_path=SPATIAL_UPSAMPLER_PATH,
         loras=[],
+        **_quantization_kwargs_for("T2V", TRANSFORMER_PATH),
         # Default OffloadMode.NONE keeps every component (transformer, text
         # encoder, VAEs) resident on GPU at once — confirmed via a real OOM on
         # a 32GB card (~30GB allocated with zero headroom for computation).
         # CPU offloading trades some speed for the ~5GB VRAM / ~36GB RAM
         # footprint documented in ltx_pipelines.utils.types.OffloadMode.
-        offload_mode=OffloadMode.CPU,
+        # T2V_OFFLOAD can change this (default "cpu" = unchanged).
+        offload_mode=_offload_mode_for("T2V"),
     )
 
 
@@ -350,14 +430,16 @@ def _load_a2v_pipeline_impl():
     model_paths = ModelPaths.from_split(
         transformer_path=_a2v_transformer_path(),
         text_encoder_path=TEXT_ENCODER_PATH,
-        video_vae_path=VIDEO_VAE_PATH,
+        video_vae_path=_video_vae_path_for("A2V"),
         audio_vae_path=AUDIO_VAE_PATH,
     )
+    logger.info(_describe_speed_options("A2V"))
     return A2VidPipelineTwoStage(
         model_paths=model_paths,
         spatial_upsampler_path=SPATIAL_UPSAMPLER_PATH,
         loras=[],
-        offload_mode=OffloadMode.CPU,
+        offload_mode=_offload_mode_for("A2V"),
+        **_quantization_kwargs_for("A2V", _a2v_transformer_path()),
         **_a2v_pipeline_kwargs(),
     )
 

@@ -606,3 +606,124 @@ def test_a2v_distilled_lora_path_that_does_not_exist_fails_loudly(monkeypatch, c
 
     with pytest.raises(ValueError, match="A2V_DISTILLED_LORA_PATH"):
         handler_module._a2v_pipeline_kwargs()
+
+
+# --- optional speed settings (<T2V|A2V>_VIDEO_VAE / _QUANTIZATION / _OFFLOAD) ----------
+# Why these exist: the model card lists a "faster, lighter" Conv VAE, FP8 casting and an
+# offload choice, but the worker hard-coded the heavy VAE, bf16 weights and CPU offload.
+# Each setting is scoped to one pipeline (T2V_* b-roll, A2V_* avatar) so b-roll can be
+# tried without touching lip sync, and UNSET must keep today's behaviour exactly.
+
+_SPEED_VARS = [
+    f"{p}_{s}" for p in ("T2V", "A2V") for s in ("VIDEO_VAE", "QUANTIZATION", "OFFLOAD")
+]
+
+
+@pytest.fixture
+def speed_env(monkeypatch, tmp_path):
+    for name in _SPEED_VARS:
+        monkeypatch.delenv(name, raising=False)
+    root = str(tmp_path)
+    monkeypatch.setattr(handler_module, "MODEL_ROOT", root)
+    monkeypatch.setattr(handler_module, "TRANSFORMER_PATH", f"{root}/transformer.safetensors")
+    monkeypatch.setattr(handler_module, "TEXT_ENCODER_PATH", f"{root}/te.safetensors")
+    monkeypatch.setattr(handler_module, "VIDEO_VAE_PATH", f"{root}/diff-vae.safetensors")
+    monkeypatch.setattr(handler_module, "AUDIO_VAE_PATH", f"{root}/audio-vae.safetensors")
+    monkeypatch.setattr(handler_module, "SPATIAL_UPSAMPLER_PATH", f"{root}/up.safetensors")
+    return tmp_path
+
+
+def _load_a2v(monkeypatch):
+    """Run the avatar loader against a stand-in A2Vid class; returns the pipeline."""
+
+    class FakeA2Vid:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    module = types.ModuleType("ltx_pipelines.a2vid_two_stage")
+    module.A2VidPipelineTwoStage = FakeA2Vid
+    monkeypatch.setitem(sys.modules, "ltx_pipelines.a2vid_two_stage", module)
+    return handler_module._load_a2v_pipeline_impl()
+
+
+def test_speed_options_unset_keep_todays_behaviour_for_both_pipelines(speed_env, monkeypatch):
+    t2v = handler_module._load_pipeline_impl()
+    a2v = _load_a2v(monkeypatch)
+
+    for pipeline in (t2v, a2v):
+        assert pipeline.kwargs["offload_mode"] == handler_module.OffloadMode.CPU
+        assert "quantization" not in pipeline.kwargs
+        assert pipeline.kwargs["model_paths"].kwargs["video_vae_path"] == handler_module.VIDEO_VAE_PATH
+
+
+def test_t2v_conv_vae_is_used_for_b_roll_only(speed_env, monkeypatch):
+    conv = speed_env / handler_module._CONV_VIDEO_VAE_REL
+    conv.parent.mkdir(parents=True)
+    conv.write_bytes(b"x")
+    monkeypatch.setenv("T2V_VIDEO_VAE", "conv")
+
+    t2v = handler_module._load_pipeline_impl()
+    a2v = _load_a2v(monkeypatch)
+
+    assert t2v.kwargs["model_paths"].kwargs["video_vae_path"] == str(conv)
+    # the avatar pipeline (lip sync) is untouched by a T2V_ setting
+    assert a2v.kwargs["model_paths"].kwargs["video_vae_path"] == handler_module.VIDEO_VAE_PATH
+
+
+def test_conv_vae_missing_from_the_cache_fails_the_load_naming_the_file_and_variable(speed_env, monkeypatch):
+    monkeypatch.setenv("T2V_VIDEO_VAE", "conv")
+
+    with pytest.raises(RuntimeError, match="T2V_VIDEO_VAE=conv.*ltx-2.5-video-vae-conv-bf16"):
+        handler_module._load_pipeline_impl()
+
+
+@pytest.mark.parametrize("name, bad", [
+    ("T2V_VIDEO_VAE", "fast"), ("A2V_QUANTIZATION", "nvfp4"), ("T2V_OFFLOAD", "gpu"),
+])
+def test_an_unknown_speed_setting_value_fails_naming_the_variable(speed_env, monkeypatch, name, bad):
+    # nvfp4 is deliberately not offered: it needs Blackwell GPUs, this endpoint is Ada (L40S).
+    monkeypatch.setenv(name, bad)
+
+    with pytest.raises(ValueError, match=name):
+        handler_module._load_pipeline_impl() if name.startswith("T2V") else _load_a2v(monkeypatch)
+
+
+def test_offload_none_is_passed_through_for_the_scoped_pipeline_only(speed_env, monkeypatch):
+    monkeypatch.setenv("T2V_OFFLOAD", "none")
+
+    assert handler_module._load_pipeline_impl().kwargs["offload_mode"] == handler_module.OffloadMode.NONE
+    assert _load_a2v(monkeypatch).kwargs["offload_mode"] == handler_module.OffloadMode.CPU
+
+
+def _fake_quantization_factory(monkeypatch):
+    seen = []
+
+    class Kind:
+        class FP8_CAST:
+            @staticmethod
+            def to_policy(path):
+                seen.append(path)
+                return f"policy-for-{path}"
+
+    module = types.ModuleType("ltx_pipelines.utils.quantization_factory")
+    module.QuantizationKind = Kind
+    monkeypatch.setitem(sys.modules, "ltx_pipelines.utils.quantization_factory", module)
+    return seen
+
+
+def test_fp8_cast_builds_the_policy_from_the_transformer_checkpoint(speed_env, monkeypatch):
+    seen = _fake_quantization_factory(monkeypatch)
+    monkeypatch.setenv("T2V_QUANTIZATION", "fp8-cast")
+
+    t2v = handler_module._load_pipeline_impl()
+
+    assert seen == [handler_module.TRANSFORMER_PATH]
+    assert t2v.kwargs["quantization"] == f"policy-for-{handler_module.TRANSFORMER_PATH}"
+
+
+def test_fp8_cast_on_an_old_library_fails_naming_the_variable(speed_env, monkeypatch):
+    monkeypatch.setitem(sys.modules, "ltx_pipelines.utils.quantization_factory", None)  # import fails
+    monkeypatch.setenv("A2V_QUANTIZATION", "fp8-cast")
+
+    with pytest.raises(RuntimeError, match="A2V_QUANTIZATION=fp8-cast"):
+        _load_a2v(monkeypatch)

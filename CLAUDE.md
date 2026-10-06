@@ -125,6 +125,8 @@ all unanswered. The `Dockerfile` still clones LTX-2 unpinned (no commit SHA has
 been proven to work). `worker-video/spike/` is throwaway and must be deleted
 before this branch merges.
 
+**Optional speed settings (worker-video, UNVERIFIED on real hardware).** `T2V_VIDEO_VAE`, `T2V_QUANTIZATION`, `T2V_OFFLOAD` (b-roll pipeline) and the same three with an `A2V_` prefix (avatar pipeline) are read when a pipeline loads. Values: `diff|conv` (video VAE; `conv` needs `vae/ltx-2.5-video-vae-conv-bf16.safetensors` in the cached model), `none|fp8-cast`, `cpu|none|disk`. Unset keeps the previous behaviour (diff VAE, bf16, CPU offload); a bad value or a missing file fails the load naming the variable. The worker logs `T2V pipeline options: ...` / `A2V pipeline options: ...` on load. Not known: whether each one is faster on an L40S 48 GB, whether `offload none` fits, whether FP8 keeps lip sync, and whether the installed `ltx_pipelines` has `quantization_factory`. Try b-roll first, avatar only with a lip-sync re-check.
+
 **GPU sizing for worker-video is tight even with CPU offload.** The 22B
 transformer + 12B text encoder alone are >60GB combined at bf16 before VAEs
 and activations; a 32GB card OOMs even with offload enabled per the comment

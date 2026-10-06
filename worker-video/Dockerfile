@@ -19,8 +19,9 @@ ENV PATH="/root/.local/bin:${PATH}"
 
 WORKDIR /worker
 
-# Model weights are NOT baked into this image — they load from the
-# RunPod Network Volume mounted at /runpod-volume at container start.
+# Model weights are NOT baked into this image — RunPod's "Cached model"
+# (Lightricks/LTX-2.5) mounts the HF cache under /runpod-volume/huggingface-cache
+# at container start; handler.py resolves the snapshot folder at runtime.
 RUN git clone --depth 1 https://github.com/Lightricks/LTX-2.git ltx2-repo
 WORKDIR /worker/ltx2-repo
 RUN uv sync --extra natten
@@ -36,4 +37,4 @@ COPY handler.py /worker/handler.py
 # against those mounted paths, so gcc's default linker search misses it even
 # though the file exists on disk. Refreshing the cache at container start
 # (not build time, when the GPU/driver mount isn't present yet) fixes this.
-CMD ["/bin/sh", "-c", "ldconfig; exec /worker/ltx2-repo/.venv/bin/python3 -u -c \"import sys; sys.path.insert(0, '/worker'); import runpod, handler; runpod.serverless.start({'handler': handler.handler})\""]
+CMD ["/bin/sh", "-c", "ldconfig; exec /worker/ltx2-repo/.venv/bin/python3 -u -c \"import sys; sys.path.insert(0, '/worker'); import runpod, handler; handler.startup(); runpod.serverless.start({'handler': handler.handler})\""]

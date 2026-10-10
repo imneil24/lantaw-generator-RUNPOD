@@ -34,6 +34,21 @@ ASPECT_RATIO_DIMENSIONS = {
 # prompt+duration and were always served landscape; keeping that behaviour is
 # backward compatibility, not a stand-in for a missing value.
 DEFAULT_ASPECT_RATIO = "16:9"
+# Optional smaller size for b-roll (t2v) only, chosen by the T2V_SIZE endpoint
+# setting ("full" = ASPECT_RATIO_DIMENSIONS, the default and today's behaviour;
+# "small" = this table, about 0.9 megapixels against 2.1). The second (refine)
+# pass dominates a b-roll clip's time and its cost grows faster than the pixel
+# count, so a smaller clip is much cheaper to make; the backend scales it back up
+# to the full size before it is joined to avatar clips. Both sides are still
+# multiples of 64 (1280 = 64 * 20, 704 = 64 * 11) for assert_resolution. Avatar
+# (ia2v) clips never use this table, so lip sync is untouched. Like the other
+# size decisions it is server-side only: a caller still picks an orientation,
+# never a width or height.
+T2V_SMALL_ASPECT_RATIO_DIMENSIONS = {
+    "16:9": (1280, 704),
+    "9:16": (704, 1280),
+}
+_T2V_SIZE_CHOICES = ("full", "small")
 FPS = 24
 # The VAE's temporal grid: a valid frame count satisfies (frames - 1) % FRAME_GRID_STEP == 0.
 FRAME_GRID_STEP = 8
@@ -254,6 +269,9 @@ def _a2v_pipeline_kwargs() -> dict:
 #                            32GB card with bf16) or "disk".
 # Whether any of these is faster on this GPU, and whether FP8 keeps lip sync intact,
 # is NOT known: they need test clips.
+# T2V_SIZE ("full" default, or "small") is read per request, not at load: it sets
+# the b-roll render size (see T2V_SMALL_ASPECT_RATIO_DIMENSIONS), has no A2V_
+# counterpart, and is UNVERIFIED on real hardware (speed and picture quality).
 _VIDEO_VAE_CHOICES = ("diff", "conv")
 _QUANTIZATION_CHOICES = ("none", "fp8-cast")
 
@@ -522,6 +540,11 @@ def validate_input(job_input: dict) -> GenerationRequest:
         if image_match.group(1) != audio_match.group(1):
             raise ValueError("image_key and audio_key must be in the same job folder")
         image_key, audio_key = job_input["image_key"], job_input["audio_key"]
+    else:
+        # b-roll only; a bad T2V_SIZE raises ValueError naming the variable,
+        # which the handler returns as the job's error.
+        if _env_choice("T2V_SIZE", _T2V_SIZE_CHOICES, "full") == "small":
+            width, height = T2V_SMALL_ASPECT_RATIO_DIMENSIONS[aspect_ratio]
 
     return GenerationRequest(
         prompt=job_input["prompt"],
@@ -550,6 +573,9 @@ def _generate_video(request: GenerationRequest) -> bytes:
     # The VAE's causal temporal grid requires (frames - 1) % FRAME_GRID_STEP == 0;
     # _frames_for_duration rounds UP to the first valid value covering the duration.
     num_frames = _frames_for_duration(request.duration)
+    # Logged on every b-roll clip so the size a clip was really made at can be
+    # read from the endpoint's logs, not inferred from the T2V_SIZE setting.
+    logger.info("T2V size: %sx%s, %s frames", request.width, request.height, num_frames)
 
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_file:
         output_path = tmp_file.name

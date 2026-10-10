@@ -727,3 +727,56 @@ def test_fp8_cast_on_an_old_library_fails_naming_the_variable(speed_env, monkeyp
 
     with pytest.raises(RuntimeError, match="A2V_QUANTIZATION=fp8-cast"):
         _load_a2v(monkeypatch)
+
+
+# T2V_SIZE: b-roll can be rendered smaller (backend scales it back up). Default
+# unset keeps today's size, and avatar clips never change size (lip sync).
+def test_t2v_size_unset_keeps_the_full_size(monkeypatch):
+    monkeypatch.delenv("T2V_SIZE", raising=False)
+    request = validate_input({"prompt": "x", "duration": 8})
+    assert (request.width, request.height) == (1920, 1088)
+
+
+@pytest.mark.parametrize(
+    "aspect_ratio, expected",
+    [("16:9", (1280, 704)), ("9:16", (704, 1280)), (None, (1280, 704))],
+)
+def test_t2v_size_small_maps_each_orientation(monkeypatch, aspect_ratio, expected):
+    monkeypatch.setenv("T2V_SIZE", "small")
+    job_input = {"prompt": "x", "duration": 8}
+    if aspect_ratio is not None:  # None = a caller that predates aspect_ratio
+        job_input["aspect_ratio"] = aspect_ratio
+    request = validate_input(job_input)
+    assert request.mode == "t2v"
+    assert (request.width, request.height) == expected
+
+
+def test_t2v_small_dimensions_are_divisible_by_64_and_cover_every_orientation():
+    # assert_resolution (see the handler.py comment) rejects anything else, so a
+    # bad table entry would fail every b-roll job at the GPU instead of here.
+    assert set(handler_module.T2V_SMALL_ASPECT_RATIO_DIMENSIONS) == set(handler_module.ASPECT_RATIO_DIMENSIONS)
+    for width, height in handler_module.T2V_SMALL_ASPECT_RATIO_DIMENSIONS.values():
+        assert width % 64 == 0 and height % 64 == 0
+
+
+def test_t2v_size_never_changes_an_avatar_clip(monkeypatch):
+    # Regression guard for the reason b-roll is tuned alone: avatar lip sync is
+    # sensitive, so T2V_SIZE must not reach the ia2v request.
+    monkeypatch.setenv("T2V_SIZE", "small")
+    request = validate_input(_ia2v_input())
+    assert request.mode == "ia2v"
+    assert (request.width, request.height) == (1088, 1920)
+
+
+def test_an_unknown_t2v_size_fails_naming_the_variable(monkeypatch):
+    monkeypatch.setenv("T2V_SIZE", "tiny")
+    with pytest.raises(ValueError, match="T2V_SIZE"):
+        validate_input({"prompt": "x", "duration": 8})
+    # and the handler reports it as the job's error instead of crashing
+    result = handler({"input": {"prompt": "x", "duration": 8}})
+    assert "T2V_SIZE" in result["error"]
+
+
+def test_a_bad_t2v_size_does_not_break_an_avatar_clip(monkeypatch):
+    monkeypatch.setenv("T2V_SIZE", "tiny")
+    assert validate_input(_ia2v_input()).mode == "ia2v"

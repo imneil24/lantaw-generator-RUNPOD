@@ -812,3 +812,48 @@ def test_an_unknown_t2v_size_fails_naming_the_variable(monkeypatch):
 def test_a_bad_t2v_size_does_not_break_an_avatar_clip(monkeypatch):
     monkeypatch.setenv("T2V_SIZE", "tiny")
     assert validate_input(_ia2v_input()).mode == "ia2v"
+
+
+# A2V_SIZE: avatar clips can be asked for a larger target so the library's
+# half-size stage 1 is about 0.9 MP (an experiment on a third-party claim that
+# a smaller first pass glues the lips shut). Unset must keep today's size.
+def test_a2v_size_unset_keeps_the_full_avatar_size(monkeypatch):
+    monkeypatch.delenv("A2V_SIZE", raising=False)
+    request = validate_input(_ia2v_input())
+    assert (request.width, request.height) == (1088, 1920)
+
+
+@pytest.mark.parametrize("aspect_ratio, expected", [("16:9", (2496, 1408)), ("9:16", (1408, 2496))])
+def test_a2v_size_large_maps_each_orientation(monkeypatch, aspect_ratio, expected):
+    monkeypatch.setenv("A2V_SIZE", "large")
+    request = validate_input({**_ia2v_input(), "aspect_ratio": aspect_ratio})
+    assert request.mode == "ia2v"
+    assert (request.width, request.height) == expected
+
+
+def test_a2v_large_dimensions_are_divisible_by_64_and_cover_every_orientation():
+    # assert_resolution rejects anything else, so a bad entry would fail every
+    # avatar job at the GPU instead of here. Half of each side (stage 1) must be
+    # a multiple of 32 too, which 64 guarantees.
+    assert set(handler_module.A2V_LARGE_ASPECT_RATIO_DIMENSIONS) == set(handler_module.ASPECT_RATIO_DIMENSIONS)
+    for width, height in handler_module.A2V_LARGE_ASPECT_RATIO_DIMENSIONS.values():
+        assert width % 64 == 0 and height % 64 == 0
+
+
+def test_a2v_size_never_changes_b_roll(monkeypatch):
+    monkeypatch.setenv("A2V_SIZE", "large")
+    monkeypatch.delenv("T2V_SIZE", raising=False)
+    request = validate_input({"prompt": "x", "duration": 8})
+    assert request.mode == "t2v"
+    assert (request.width, request.height) == (1920, 1088)
+
+
+def test_an_unknown_a2v_size_fails_an_avatar_clip_naming_the_variable(monkeypatch):
+    monkeypatch.setenv("A2V_SIZE", "huge")
+    with pytest.raises(ValueError, match="A2V_SIZE"):
+        validate_input(_ia2v_input())
+
+
+def test_a_bad_a2v_size_does_not_break_b_roll(monkeypatch):
+    monkeypatch.setenv("A2V_SIZE", "huge")
+    assert validate_input({"prompt": "x", "duration": 8}).mode == "t2v"

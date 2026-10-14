@@ -49,6 +49,21 @@ T2V_SMALL_ASPECT_RATIO_DIMENSIONS = {
     "9:16": (704, 1280),
 }
 _T2V_SIZE_CHOICES = ("full", "small")
+# Optional LARGER size for avatar (ia2v) clips only, chosen by the A2V_SIZE
+# endpoint setting ("full" = ASPECT_RATIO_DIMENSIONS, the default and today's
+# behaviour). A TEST setting: A2VidPipelineTwoStage renders stage 1 at half the
+# target (a2vid_two_stage.py: stage_1_width = width // 2), so the 1088x1920
+# target gives a 544x960 (0.52 MP) first pass, and a third-party guide claims
+# lips "get glued together" below about 0.9 MP. "large" targets about 3.5 MP so
+# stage 1 is about 0.88 MP (704x1248). Both sides are multiples of 64 (1408 = 64 *
+# 22, 2496 = 64 * 39) for assert_resolution. A clip of this size is NOT the
+# size the backend joins avatar clips at (concat_videos stream-copies), so it is
+# only for single-clip experiments. Server-side only, like every size decision.
+A2V_LARGE_ASPECT_RATIO_DIMENSIONS = {
+    "16:9": (2496, 1408),
+    "9:16": (1408, 2496),
+}
+_A2V_SIZE_CHOICES = ("full", "large")
 FPS = 24
 # The VAE's temporal grid: a valid frame count satisfies (frames - 1) % FRAME_GRID_STEP == 0.
 FRAME_GRID_STEP = 8
@@ -159,6 +174,8 @@ logger = logging.getLogger("worker-video")
 #   A2V_STG_SCALE               video STG scale (0 disables)
 #   A2V_RESCALE_SCALE           video rescale scale (limits over-saturation)
 #   A2V_MODALITY_SCALE          audio-to-video modality scale (lip sync; 1.0 off)
+#   A2V_SIZE                    "full" (default) or "large": the avatar clip's target
+#                               size, read per call (see A2V_LARGE_ASPECT_RATIO_DIMENSIONS)
 #   A2V_IMAGE_STRENGTH          how firmly frame 0 is pinned to the photo, 0 to 1
 #                               (default 1.0; read per call, no restart needed)
 # The meaning of the four guidance values is from the LTX-2 library's
@@ -557,6 +574,9 @@ def validate_input(job_input: dict) -> GenerationRequest:
         if image_match.group(1) != audio_match.group(1):
             raise ValueError("image_key and audio_key must be in the same job folder")
         image_key, audio_key = job_input["image_key"], job_input["audio_key"]
+        # avatar only; a bad A2V_SIZE raises ValueError naming the variable.
+        if _env_choice("A2V_SIZE", _A2V_SIZE_CHOICES, "full") == "large":
+            width, height = A2V_LARGE_ASPECT_RATIO_DIMENSIONS[aspect_ratio]
     else:
         # b-roll only; a bad T2V_SIZE raises ValueError naming the variable,
         # which the handler returns as the job's error.
@@ -638,6 +658,10 @@ def _generate_ia2v_video(request: GenerationRequest) -> bytes:
     # Same helper as t2v: snap_frames_to_grid floors, which would leave a
     # whole-second clip 0.29s short (see _frames_for_duration).
     num_frames = _frames_for_duration(request.duration)
+    # Logged on every avatar clip, like the T2V line, so the size a clip was
+    # really made at can be read from the endpoint's logs (target size; the
+    # library renders stage 1 at half of it).
+    logger.info("A2V size: %sx%s, %s frames", request.width, request.height, num_frames)
 
     with tempfile.TemporaryDirectory() as workdir:
         image_path = os.path.join(workdir, "image" + os.path.splitext(request.image_key)[1])

@@ -523,6 +523,7 @@ def _fake_constants(monkeypatch, seen=None):
 _A2V_ENV = (
     "A2V_TRANSFORMER_PATH", "A2V_DISTILLED_LORA_PATH", "A2V_DISTILLED_LORA_STRENGTH",
     "A2V_NUM_INFERENCE_STEPS", "A2V_CFG_SCALE", "A2V_STG_SCALE", "A2V_RESCALE_SCALE", "A2V_MODALITY_SCALE",
+    "A2V_IMAGE_STRENGTH",
 )
 
 
@@ -586,6 +587,37 @@ def test_a2v_bad_env_values_fail_loudly_naming_the_variable(monkeypatch, clean_a
 
     with pytest.raises(ValueError, match=name):
         handler_module._a2v_call_kwargs()
+
+
+def _fake_image_types(monkeypatch):
+    fake = types.ModuleType("ltx_pipelines.utils.types")
+    fake.ImageConditioningInput = lambda path, frame_idx, strength: (path, frame_idx, strength)
+    monkeypatch.setitem(sys.modules, "ltx_pipelines.utils.types", fake)
+
+
+def test_a2v_image_strength_defaults_to_the_old_fixed_1_0(monkeypatch, clean_a2v_env):
+    # Deploying must not change any clip until the variable is set.
+    _fake_image_types(monkeypatch)
+
+    assert handler_module._image_conditioning("/p.jpg") == ("/p.jpg", 0, 1.0)
+
+
+def test_a2v_image_strength_env_var_sets_the_frame_0_strength(monkeypatch, clean_a2v_env):
+    _fake_image_types(monkeypatch)
+    monkeypatch.setenv("A2V_IMAGE_STRENGTH", "0.7")
+
+    assert handler_module._image_conditioning("/p.jpg") == ("/p.jpg", 0, 0.7)
+
+
+@pytest.mark.parametrize("value", ["abc", "-0.1", "nan", "1.5"])
+def test_a2v_bad_image_strength_fails_loudly_naming_the_variable(monkeypatch, clean_a2v_env, value):
+    # A typo or an out-of-range value must not silently become 1.0: the clip
+    # would be made with a setting the operator did not intend.
+    _fake_image_types(monkeypatch)
+    monkeypatch.setenv("A2V_IMAGE_STRENGTH", value)
+
+    with pytest.raises(ValueError, match="A2V_IMAGE_STRENGTH"):
+        handler_module._image_conditioning("/p.jpg")
 
 
 def test_a2v_distilled_lora_env_builds_the_library_lora_tuple(monkeypatch, clean_a2v_env, tmp_path):

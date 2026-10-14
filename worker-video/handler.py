@@ -159,6 +159,8 @@ logger = logging.getLogger("worker-video")
 #   A2V_STG_SCALE               video STG scale (0 disables)
 #   A2V_RESCALE_SCALE           video rescale scale (limits over-saturation)
 #   A2V_MODALITY_SCALE          audio-to-video modality scale (lip sync; 1.0 off)
+#   A2V_IMAGE_STRENGTH          how firmly frame 0 is pinned to the photo, 0 to 1
+#                               (default 1.0; read per call, no restart needed)
 # The meaning of the four guidance values is from the LTX-2 library's
 # docs/multimodal-guidance.md (Lightricks/LTX-2 main). Good VALUES for this
 # model are not known: they need short test clips.
@@ -180,6 +182,19 @@ def _env_float(name: str) -> float | None:
         raise ValueError(f"{name} must be a number, got {raw!r}") from None
     if not math.isfinite(value) or value < 0:
         raise ValueError(f"{name} must be a finite number >= 0, got {raw!r}")
+    return value
+
+
+def _a2v_image_strength() -> float:
+    # How firmly frame 0 is pinned to the avatar photo (0 to 1). It was a fixed
+    # 1.0 (the most rigid setting); community avatar pipelines default to 0.7 and
+    # describe lower values as "more motion". UNSET keeps 1.0, so deploying this
+    # changes nothing until A2V_IMAGE_STRENGTH is set. Good values are untested.
+    value = _env_float("A2V_IMAGE_STRENGTH")
+    if value is None:
+        return 1.0
+    if value > 1.0:
+        raise ValueError(f"A2V_IMAGE_STRENGTH must be between 0 and 1, got {value}")
     return value
 
 
@@ -479,7 +494,9 @@ def _image_conditioning(path: str):
     # confirm against the spike findings ("Signatures").
     from ltx_pipelines.utils.types import ImageConditioningInput
 
-    return ImageConditioningInput(path=path, frame_idx=0, strength=1.0)
+    strength = _a2v_image_strength()
+    logger.info("A2V image conditioning: frame_idx=0 strength=%s", strength)
+    return ImageConditioningInput(path=path, frame_idx=0, strength=strength)
 
 
 # Keys the backend stages for an ia2v job: runpod-inputs/<job uuid>/image.<ext>

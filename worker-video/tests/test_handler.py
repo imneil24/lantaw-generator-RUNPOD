@@ -523,7 +523,7 @@ def _fake_constants(monkeypatch, seen=None):
 _A2V_ENV = (
     "A2V_TRANSFORMER_PATH", "A2V_DISTILLED_LORA_PATH", "A2V_DISTILLED_LORA_STRENGTH",
     "A2V_NUM_INFERENCE_STEPS", "A2V_CFG_SCALE", "A2V_STG_SCALE", "A2V_RESCALE_SCALE", "A2V_MODALITY_SCALE",
-    "A2V_IMAGE_STRENGTH",
+    "A2V_IMAGE_STRENGTH", "A2V_STAGE1_SIGMAS",
 )
 
 
@@ -586,6 +586,67 @@ def test_a2v_bad_env_values_fail_loudly_naming_the_variable(monkeypatch, clean_a
     monkeypatch.setenv(name, value)
 
     with pytest.raises(ValueError, match=name):
+        handler_module._a2v_call_kwargs()
+
+
+# A2V_STAGE1_SIGMAS=distilled: run stage 1 on the library's fixed 8-step distilled
+# schedule (the schedule both community ComfyUI avatar graphs use) instead of the
+# scheduler's own sigmas for A2V_NUM_INFERENCE_STEPS. Regression background: until
+# this setting, handler.py never passed stage_1_sigmas, so every earlier "8 steps"
+# or "guidance off" test ran off the distilled schedule and was not a fair test.
+_DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+
+
+def _fake_torch_with_tensor(monkeypatch):
+    # The venv's torch is a stub without tensor(); record what handler asks for.
+    fake = SimpleNamespace(
+        float32="float32",
+        tensor=lambda values, dtype=None: ("tensor", list(values), dtype),
+        no_grad=contextlib.nullcontext,
+    )
+    monkeypatch.setattr(handler_module, "torch", fake)
+
+
+def test_a2v_stage1_sigmas_are_not_passed_by_default(monkeypatch, clean_a2v_env):
+    # Deploying must not change any clip until the variable is set.
+    _fake_constants(monkeypatch)
+
+    assert "stage_1_sigmas" not in handler_module._a2v_call_kwargs()
+
+
+def test_a2v_stage1_sigmas_distilled_passes_the_librarys_eight_step_schedule(monkeypatch, clean_a2v_env):
+    _fake_constants(monkeypatch)
+    sys.modules["ltx_pipelines.utils.constants"].DISTILLED_SIGMA_VALUES = _DISTILLED_SIGMAS
+    _fake_torch_with_tensor(monkeypatch)
+    monkeypatch.setenv("A2V_STAGE1_SIGMAS", "distilled")
+
+    kwargs = handler_module._a2v_call_kwargs()
+
+    assert kwargs["stage_1_sigmas"] == ("tensor", _DISTILLED_SIGMAS, "float32")
+    # guidance is still whatever A2V_*_SCALE says, so the experiment is
+    # distilled sigmas + A2V_CFG_SCALE=1 / A2V_STG_SCALE=0 / A2V_MODALITY_SCALE=1.
+    assert kwargs["video_guider_params"] == _Guider()
+
+
+@pytest.mark.parametrize("value", ["Distilled-ish", "8", "true", "scheduler"])
+def test_a2v_stage1_sigmas_bad_value_fails_naming_the_variable(monkeypatch, clean_a2v_env, value):
+    # A typo must not silently fall back to the scheduler: the clip would be made
+    # on the old schedule and look like a failed experiment.
+    _fake_constants(monkeypatch)
+    monkeypatch.setenv("A2V_STAGE1_SIGMAS", value)
+
+    with pytest.raises(ValueError, match="A2V_STAGE1_SIGMAS"):
+        handler_module._a2v_call_kwargs()
+
+
+def test_a2v_stage1_sigmas_missing_library_constant_fails_loudly(monkeypatch, clean_a2v_env):
+    # An older library without DISTILLED_SIGMA_VALUES must not fall back to a
+    # hard-coded copy of the list.
+    _fake_constants(monkeypatch)
+    _fake_torch_with_tensor(monkeypatch)
+    monkeypatch.setenv("A2V_STAGE1_SIGMAS", "distilled")
+
+    with pytest.raises(RuntimeError, match="A2V_STAGE1_SIGMAS"):
         handler_module._a2v_call_kwargs()
 
 

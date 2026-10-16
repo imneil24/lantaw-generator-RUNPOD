@@ -176,6 +176,9 @@ logger = logging.getLogger("worker-video")
 #   A2V_MODALITY_SCALE          audio-to-video modality scale (lip sync; 1.0 off)
 #   A2V_SIZE                    "full" (default) or "large": the avatar clip's target
 #                               size, read per call (see A2V_LARGE_ASPECT_RATIO_DIMENSIONS)
+#   A2V_STAGE1_SIGMAS           "distilled": stage 1 uses the library's fixed 8-step
+#                               distilled schedule and A2V_NUM_INFERENCE_STEPS is
+#                               ignored (unset = the scheduler's sigmas, as before)
 #   A2V_IMAGE_STRENGTH          how firmly frame 0 is pinned to the photo, 0 to 1
 #                               (default 1.0; read per call, no restart needed)
 # The meaning of the four guidance values is from the LTX-2 library's
@@ -250,17 +253,50 @@ def _a2v_call_kwargs() -> dict:
     if guider_overrides:
         guider = replace(guider, **guider_overrides)
 
+    stage_1_sigmas = _a2v_stage_1_sigmas()
+
     # Logged on every call so the values a clip was really made with can be read
     # from the endpoint's logs, not inferred from code.
     logger.info(
-        "A2V settings: transformer=%s steps=%s guider=%s",
+        "A2V settings: transformer=%s steps=%s guider=%s stage1_sigmas=%s",
         _a2v_transformer_path(), steps, guider,
+        "distilled (steps ignored)" if stage_1_sigmas is not None else "scheduler",
     )
-    return {
+    kwargs = {
         "negative_prompt": DEFAULT_NEGATIVE_PROMPT,
         "num_inference_steps": steps,
         "video_guider_params": guider,
     }
+    if stage_1_sigmas is not None:
+        kwargs["stage_1_sigmas"] = stage_1_sigmas
+    return kwargs
+
+
+def _a2v_stage_1_sigmas():
+    # A2V_STAGE1_SIGMAS=distilled runs stage 1 on the library's fixed 8-step
+    # distilled schedule (DISTILLED_SIGMA_VALUES, the same list both community
+    # ComfyUI avatar graphs use) instead of the scheduler's sigmas for
+    # A2V_NUM_INFERENCE_STEPS. A2VidPipelineTwoStage.__call__ takes
+    # `stage_1_sigmas` and, when given, bypasses num_inference_steps (read from
+    # Lightricks/LTX-2 main, a2vid_two_stage.py). UNSET keeps the old behaviour,
+    # so deploying this changes nothing until the variable is set. Meant to be
+    # combined with A2V_CFG_SCALE=1, A2V_STG_SCALE=0, A2V_MODALITY_SCALE=1;
+    # whether that gives a calm, talking face is UNTESTED.
+    value = os.environ.get("A2V_STAGE1_SIGMAS", "").strip()
+    if not value:
+        return None
+    if value != "distilled":
+        raise ValueError(f"A2V_STAGE1_SIGMAS must be 'distilled' or unset, got {value!r}")
+    try:
+        from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES
+    except ImportError as exc:
+        # No hard-coded copy of the list: a library without it should fail the
+        # clip, not run a schedule nobody checked.
+        raise RuntimeError(
+            "A2V_STAGE1_SIGMAS=distilled needs ltx_pipelines.utils.constants.DISTILLED_SIGMA_VALUES, "
+            "which this library version does not have"
+        ) from exc
+    return torch.tensor(list(DISTILLED_SIGMA_VALUES), dtype=torch.float32)
 
 
 def _a2v_pipeline_kwargs() -> dict:

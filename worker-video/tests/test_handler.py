@@ -523,7 +523,7 @@ def _fake_constants(monkeypatch, seen=None):
 _A2V_ENV = (
     "A2V_TRANSFORMER_PATH", "A2V_DISTILLED_LORA_PATH", "A2V_DISTILLED_LORA_STRENGTH",
     "A2V_NUM_INFERENCE_STEPS", "A2V_CFG_SCALE", "A2V_STG_SCALE", "A2V_RESCALE_SCALE", "A2V_MODALITY_SCALE",
-    "A2V_IMAGE_STRENGTH", "A2V_STAGE1_SIGMAS",
+    "A2V_IMAGE_STRENGTH", "A2V_STAGE1_SIGMAS", "A2V_LAST_FRAME_STRENGTH",
 )
 
 
@@ -679,6 +679,74 @@ def test_a2v_bad_image_strength_fails_loudly_naming_the_variable(monkeypatch, cl
 
     with pytest.raises(ValueError, match="A2V_IMAGE_STRENGTH"):
         handler_module._image_conditioning("/p.jpg")
+
+
+def test_a2v_last_frame_pin_is_off_by_default_and_does_not_import_the_library(monkeypatch, clean_a2v_env):
+    # Deploying must not change any clip until A2V_LAST_FRAME_STRENGTH is set.
+    monkeypatch.delitem(sys.modules, "ltx_pipelines.utils.types", raising=False)
+
+    assert handler_module._last_frame_conditioning("/p.jpg", 153) == []
+    monkeypatch.setenv("A2V_LAST_FRAME_STRENGTH", "0")
+    assert handler_module._last_frame_conditioning("/p.jpg", 153) == []
+
+
+def test_a2v_last_frame_pin_uses_the_final_frame_index_and_the_set_strength(monkeypatch, clean_a2v_env):
+    _fake_image_types(monkeypatch)
+    monkeypatch.setenv("A2V_LAST_FRAME_STRENGTH", "0.7")
+
+    # the library accepts 0 <= frame_idx < num_frames, so the last frame is num_frames - 1
+    assert handler_module._last_frame_conditioning("/p.jpg", 153) == [("/p.jpg", 152, 0.7)]
+
+
+@pytest.mark.parametrize("value", ["abc", "-0.1", "nan", "1.5"])
+def test_a2v_bad_last_frame_strength_fails_loudly_naming_the_variable(monkeypatch, clean_a2v_env, value):
+    _fake_image_types(monkeypatch)
+    monkeypatch.setenv("A2V_LAST_FRAME_STRENGTH", value)
+
+    with pytest.raises(ValueError, match="A2V_LAST_FRAME_STRENGTH"):
+        handler_module._last_frame_conditioning("/p.jpg", 153)
+
+
+def test_a2v_last_frame_pin_refuses_a_one_frame_clip(monkeypatch, clean_a2v_env):
+    _fake_image_types(monkeypatch)
+    monkeypatch.setenv("A2V_LAST_FRAME_STRENGTH", "0.7")
+
+    with pytest.raises(ValueError, match="last frame"):
+        handler_module._last_frame_conditioning("/p.jpg", 1)
+
+
+def test_generate_ia2v_video_adds_the_last_frame_pin_after_the_first(monkeypatch, clean_a2v_env):
+    # End to end through _generate_ia2v_video: both pins go to the pipeline, frame 0 first.
+    _fake_image_types(monkeypatch)
+    monkeypatch.setenv("A2V_LAST_FRAME_STRENGTH", "0.7")
+    calls = {}
+
+    class FakePipeline:
+        def __call__(self, **kwargs):
+            calls["pipeline"] = kwargs
+            return SimpleNamespace(video="v", audio="a", num_frames=145, tiling_config="t")
+
+    def fake_encode(video, fps, audio, output_path, video_chunks_number):
+        with open(output_path, "wb") as f:
+            f.write(b"mp4-bytes")
+
+    def fake_download(key, dest_path):
+        with open(dest_path, "wb") as f:
+            f.write(b"data")
+
+    monkeypatch.setattr(handler_module, "load_a2v_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(handler_module, "_download_from_r2", fake_download)
+    monkeypatch.setattr(handler_module, "_a2v_call_kwargs", lambda: {})
+    monkeypatch.setattr(handler_module, "encode_video", fake_encode)
+    monkeypatch.setattr(handler_module, "get_video_chunks_number", lambda *a: 1)
+    monkeypatch.setattr(handler_module, "torch", SimpleNamespace(no_grad=contextlib.nullcontext))
+
+    handler_module._generate_ia2v_video(validate_input(_ia2v_input()))
+
+    images = calls["pipeline"]["images"]
+    num_frames = calls["pipeline"]["num_frames"]
+    assert [(i[1], i[2]) for i in images] == [(0, 1.0), (num_frames - 1, 0.7)]
+    assert images[0][0] == images[1][0]
 
 
 def test_a2v_distilled_lora_env_builds_the_library_lora_tuple(monkeypatch, clean_a2v_env, tmp_path):

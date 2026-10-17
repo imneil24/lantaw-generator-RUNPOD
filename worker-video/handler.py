@@ -552,6 +552,36 @@ def _image_conditioning(path: str):
     return ImageConditioningInput(path=path, frame_idx=0, strength=strength)
 
 
+def _a2v_last_frame_strength() -> float:
+    # How firmly the LAST frame is pinned to the same avatar photo (0 to 1). The
+    # ltx-2.5-template-files avatar workflow pins both ends of a clip at 0.7.
+    # UNSET or 0 means off (only frame 0 is pinned, as before), so deploying this
+    # changes nothing until A2V_LAST_FRAME_STRENGTH is set. Good values are untested.
+    value = _env_float("A2V_LAST_FRAME_STRENGTH")
+    if value is None:
+        return 0.0
+    if value > 1.0:
+        raise ValueError(f"A2V_LAST_FRAME_STRENGTH must be between 0 and 1, got {value}")
+    return value
+
+
+def _last_frame_conditioning(path: str, num_frames: int) -> list:
+    # An extra pin of the same photo at the final frame index (num_frames - 1; the
+    # library's assert_image_frames_in_clip accepts 0 <= frame_idx < num_frames).
+    # Returns [] when A2V_LAST_FRAME_STRENGTH is unset or 0, and then never touches
+    # the library import.
+    strength = _a2v_last_frame_strength()
+    if strength == 0.0:
+        return []
+    if num_frames < 2:
+        raise ValueError(f"cannot pin a last frame in a clip of {num_frames} frames")
+    from ltx_pipelines.utils.types import ImageConditioningInput
+
+    frame_idx = num_frames - 1
+    logger.info("A2V last-frame conditioning: frame_idx=%s strength=%s", frame_idx, strength)
+    return [ImageConditioningInput(path=path, frame_idx=frame_idx, strength=strength)]
+
+
 # Keys the backend stages for an ia2v job: runpod-inputs/<job uuid>/image.<ext>
 # and .../audio.<ext>. job ids are UUIDs (every top-level folder of the live
 # bucket that matched a jobs.id was UUID-named). Matched with fullmatch so a
@@ -715,7 +745,10 @@ def _generate_ia2v_video(request: GenerationRequest) -> bytes:
                 width=request.width,
                 frame_rate=FPS,
                 num_frames=num_frames,
-                images=[_image_conditioning(image_path)],
+                images=[
+                    _image_conditioning(image_path),
+                    *_last_frame_conditioning(image_path, num_frames),
+                ],
                 audio_path=audio_path,
                 **_a2v_call_kwargs(),
             )

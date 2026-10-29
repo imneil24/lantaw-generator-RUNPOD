@@ -380,6 +380,151 @@ def test_generate_ia2v_video_feeds_the_downloaded_files_to_the_a2v_pipeline(monk
     assert calls["encode"] == {"video": "v", "audio": "a", "fps": handler_module.FPS}
 
 
+def _i2v_input(**overrides):
+    base = {
+        "prompt": "a woman walks along a forest trail",
+        "duration": 6,
+        "aspect_ratio": "9:16",
+        "start_image_key": IMAGE_KEY,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_validate_input_accepts_an_i2v_payload_and_sizes_it_like_b_roll():
+    request = validate_input(_i2v_input())
+    assert request.mode == "i2v"
+    assert request.start_image_key == IMAGE_KEY
+    assert request.image_key is None and request.audio_key is None
+    assert (request.width, request.height) == (1088, 1920)
+
+
+def test_i2v_follows_the_b_roll_size_setting_not_the_avatar_one(monkeypatch):
+    # The still feeds the b-roll model, so T2V_SIZE applies and A2V_SIZE must not.
+    monkeypatch.setenv("T2V_SIZE", "small")
+    monkeypatch.setenv("A2V_SIZE", "large")
+    request = validate_input(_i2v_input(aspect_ratio="16:9"))
+    assert (request.width, request.height) == (1280, 704)
+
+
+@pytest.mark.parametrize(
+    "start_image_key",
+    [
+        "https://evil.example.com/a.jpg",
+        "runpod-inputs/../secrets/image.jpg",
+        f"runpod-inputs/{JOB_ID}/audio.mp3",
+        f"runpod-inputs/{JOB_ID}/image.jpg\n",
+        "",
+        None,
+        7,
+    ],
+)
+def test_validate_input_rejects_a_bad_start_image_key(start_image_key):
+    with pytest.raises(ValueError):
+        validate_input(_i2v_input(start_image_key=start_image_key))
+
+
+def test_start_image_key_cannot_be_mixed_with_the_avatar_keys():
+    # image_key + audio_key is the avatar (ia2v) contract; mixing would make the
+    # mode ambiguous, so it is refused rather than one silently winning.
+    with pytest.raises(ValueError, match="cannot be combined"):
+        validate_input(_i2v_input(image_key=IMAGE_KEY, audio_key=AUDIO_KEY))
+    with pytest.raises(ValueError, match="cannot be combined"):
+        validate_input(_i2v_input(audio_key=AUDIO_KEY))
+
+
+def test_image_key_alone_is_still_refused_as_before():
+    # Regression guard: adding i2v must not turn a half-sent avatar job into a clip.
+    payload = _ia2v_input()
+    del payload["audio_key"]
+    with pytest.raises(ValueError, match="together"):
+        validate_input(payload)
+
+
+def test_handler_routes_i2v_to_the_i2v_generator_only(monkeypatch):
+    calls = []
+    monkeypatch.setattr("handler._generate_video", lambda request: calls.append("t2v") or b"x")
+    monkeypatch.setattr("handler._generate_ia2v_video", lambda request: calls.append("ia2v") or b"y")
+    monkeypatch.setattr("handler._generate_i2v_video", lambda request: calls.append("i2v") or b"z")
+    uploaded = {}
+    monkeypatch.setattr(
+        "handler._upload_to_r2", lambda key, data, content_type: uploaded.update(data=data, key=key)
+    )
+
+    result = handler({"input": _i2v_input()})
+
+    assert calls == ["i2v"]
+    assert uploaded["data"] == b"z"
+    assert result == {"key": uploaded["key"]}
+
+
+def test_generate_i2v_video_pins_the_downloaded_still_to_frame_0(monkeypatch):
+    calls = {}
+
+    class FakePipeline:
+        def __call__(self, **kwargs):
+            calls["pipeline"] = kwargs
+            return SimpleNamespace(video="v", audio="a", num_frames=145, tiling_config="t")
+
+    def fake_download(key, dest_path):
+        calls["download"] = key
+        with open(dest_path, "wb") as f:
+            f.write(b"data")
+
+    def fake_encode(video, fps, audio, output_path, video_chunks_number):
+        with open(output_path, "wb") as f:
+            f.write(b"mp4-bytes")
+
+    monkeypatch.setattr(handler_module, "load_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(handler_module, "_download_from_r2", fake_download)
+    monkeypatch.setattr(handler_module, "_start_image_conditioning", lambda path: ("start", path))
+    monkeypatch.setattr(handler_module, "encode_video", fake_encode)
+    monkeypatch.setattr(handler_module, "get_video_chunks_number", lambda *a: 1)
+    monkeypatch.setattr(handler_module, "torch", SimpleNamespace(no_grad=contextlib.nullcontext))
+
+    out = handler_module._generate_i2v_video(validate_input(_i2v_input()))
+
+    assert out == b"mp4-bytes"
+    assert calls["download"] == IMAGE_KEY
+    images = calls["pipeline"]["images"]
+    assert len(images) == 1 and images[0][0] == "start" and images[0][1].endswith(".jpg")
+    # no audio_path: this is the plain b-roll pipeline, not A2Vid
+    assert "audio_path" not in calls["pipeline"]
+
+
+def test_a_plain_t2v_clip_still_passes_no_images(monkeypatch):
+    # Regression guard for the existing b-roll path after _generate_video gained image_path.
+    seen = {}
+
+    class FakePipeline:
+        def __call__(self, **kwargs):
+            seen.update(kwargs)
+            return SimpleNamespace(video="v", audio="a", num_frames=145, tiling_config="t")
+
+    def fake_encode(video, fps, audio, output_path, video_chunks_number):
+        with open(output_path, "wb") as f:
+            f.write(b"mp4-bytes")
+
+    monkeypatch.setattr(handler_module, "load_pipeline", lambda: FakePipeline())
+    monkeypatch.setattr(handler_module, "encode_video", fake_encode)
+    monkeypatch.setattr(handler_module, "get_video_chunks_number", lambda *a: 1)
+    monkeypatch.setattr(handler_module, "torch", SimpleNamespace(no_grad=contextlib.nullcontext))
+
+    handler_module._generate_video(validate_input({"prompt": "x", "duration": 6}))
+    assert seen["images"] == []
+
+
+def test_i2v_image_strength_defaults_to_1_and_fails_loudly_when_bad(monkeypatch):
+    _fake_image_types(monkeypatch)
+    monkeypatch.delenv("I2V_IMAGE_STRENGTH", raising=False)
+    assert handler_module._start_image_conditioning("/p.jpg") == ("/p.jpg", 0, 1.0)
+    monkeypatch.setenv("I2V_IMAGE_STRENGTH", "0.8")
+    assert handler_module._start_image_conditioning("/p.jpg") == ("/p.jpg", 0, 0.8)
+    monkeypatch.setenv("I2V_IMAGE_STRENGTH", "1.5")
+    with pytest.raises(ValueError, match="I2V_IMAGE_STRENGTH"):
+        handler_module._start_image_conditioning("/p.jpg")
+
+
 def test_a2v_call_kwargs_come_from_the_librarys_detect_params(monkeypatch):
     seen = {}
 

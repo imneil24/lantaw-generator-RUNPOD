@@ -601,10 +601,17 @@ class GenerationRequest:
     height: int
     image_key: str | None = None
     audio_key: str | None = None
+    # i2v: a silent-prompt clip that starts from this still (b-roll with a known
+    # person or place). Separate from image_key, which only exists with audio_key.
+    start_image_key: str | None = None
 
     @property
     def mode(self) -> str:
-        return "ia2v" if self.image_key is not None else "t2v"
+        if self.image_key is not None:
+            return "ia2v"
+        if self.start_image_key is not None:
+            return "i2v"
+        return "t2v"
 
 
 def _validated_key(job_input: dict, field: str, pattern: re.Pattern) -> re.Match:
@@ -616,7 +623,7 @@ def _validated_key(job_input: dict, field: str, pattern: re.Pattern) -> re.Match
 
 
 def validate_input(job_input: dict) -> GenerationRequest:
-    allowed_keys = {"prompt", "duration", "aspect_ratio", "image_key", "audio_key"}
+    allowed_keys = {"prompt", "duration", "aspect_ratio", "image_key", "audio_key", "start_image_key"}
     if set(job_input.keys()) - allowed_keys:
         raise ValueError(f"unexpected fields: {set(job_input.keys()) - allowed_keys}")
     if "prompt" not in job_input or not isinstance(job_input["prompt"], str) or not job_input["prompt"].strip():
@@ -631,8 +638,13 @@ def validate_input(job_input: dict) -> GenerationRequest:
         raise ValueError(f"aspect_ratio must be one of {sorted(ASPECT_RATIO_DIMENSIONS)}")
     width, height = ASPECT_RATIO_DIMENSIONS[aspect_ratio]
 
-    image_key = audio_key = None
-    if ("image_key" in job_input) != ("audio_key" in job_input):
+    image_key = audio_key = start_image_key = None
+    if "start_image_key" in job_input:
+        if "image_key" in job_input or "audio_key" in job_input:
+            raise ValueError("start_image_key cannot be combined with image_key or audio_key")
+        _validated_key(job_input, "start_image_key", IMAGE_KEY_PATTERN)
+        start_image_key = job_input["start_image_key"]
+    elif ("image_key" in job_input) != ("audio_key" in job_input):
         raise ValueError("image_key and audio_key must be provided together")
     if "image_key" in job_input:
         image_match = _validated_key(job_input, "image_key", IMAGE_KEY_PATTERN)
@@ -656,6 +668,7 @@ def validate_input(job_input: dict) -> GenerationRequest:
         height=height,
         image_key=image_key,
         audio_key=audio_key,
+        start_image_key=start_image_key,
     )
 
 
@@ -671,7 +684,35 @@ def _frames_for_duration(duration: float) -> int:
     return snap_frames_to_grid(target + FRAME_GRID_STEP - 1)
 
 
-def _generate_video(request: GenerationRequest) -> bytes:
+def _i2v_image_strength() -> float:
+    # How firmly frame 0 is pinned to the start still (0 to 1) for an i2v clip.
+    # UNSET keeps 1.0. Good values are untested for this pipeline.
+    value = _env_float("I2V_IMAGE_STRENGTH")
+    if value is None:
+        return 1.0
+    if value > 1.0:
+        raise ValueError(f"I2V_IMAGE_STRENGTH must be between 0 and 1, got {value}")
+    return value
+
+
+def _start_image_conditioning(path: str):
+    # Same constructor as _image_conditioning (the deployed ltx_pipelines accepts
+    # path/frame_idx/strength); DistilledPipeline takes the same `images` list.
+    from ltx_pipelines.utils.types import ImageConditioningInput
+
+    strength = _i2v_image_strength()
+    logger.info("I2V start image: frame_idx=0 strength=%s", strength)
+    return ImageConditioningInput(path=path, frame_idx=0, strength=strength)
+
+
+def _generate_i2v_video(request: GenerationRequest) -> bytes:
+    with tempfile.TemporaryDirectory() as workdir:
+        image_path = os.path.join(workdir, "start" + os.path.splitext(request.start_image_key)[1])
+        _download_from_r2(request.start_image_key, image_path)
+        return _generate_video(request, image_path=image_path)
+
+
+def _generate_video(request: GenerationRequest, image_path: str | None = None) -> bytes:
     pipeline = load_pipeline()
     # The VAE's causal temporal grid requires (frames - 1) % FRAME_GRID_STEP == 0;
     # _frames_for_duration rounds UP to the first valid value covering the duration.
@@ -703,7 +744,7 @@ def _generate_video(request: GenerationRequest) -> bytes:
                 height=request.height,
                 width=request.width,
                 frame_rate=FPS,
-                images=[],
+                images=[_start_image_conditioning(image_path)] if image_path else [],
                 num_frames=num_frames,
             )
             encode_video(
@@ -776,6 +817,8 @@ def handler(job: dict) -> dict:
 
     if request.mode == "ia2v":
         video_bytes = _generate_ia2v_video(request)
+    elif request.mode == "i2v":
+        video_bytes = _generate_i2v_video(request)
     else:
         video_bytes = _generate_video(request)
     key =f"clips/{uuid.uuid4().hex}.mp4"
